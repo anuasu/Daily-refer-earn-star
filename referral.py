@@ -1,5 +1,7 @@
-import telebot
+from urllib.parse import quote
+
 from telebot import types
+from html import escape
 
 from config import REFERRAL_REWARD
 from database import (
@@ -8,19 +10,23 @@ from database import (
     process_referral,
     get_user_stats,
 )
-
 from bot_instance import bot
 
 
 # =====================================================
-# HELPER FUNCTIONS
+# REWARD SETTINGS
+# =====================================================
+
+REFERRED_USER_REWARD = 5
+
+
+# =====================================================
+# DISPLAY HELPERS
 # =====================================================
 
 def get_display_name(user):
-    """Return a readable name for a Telegram user."""
-
     if not user:
-        return "Unknown User"
+        return "Telegram User"
 
     first_name = getattr(user, "first_name", None) or ""
     last_name = getattr(user, "last_name", None) or ""
@@ -28,21 +34,13 @@ def get_display_name(user):
 
     full_name = f"{first_name} {last_name}".strip()
 
-    if full_name and username:
-        return f"{full_name} (@{username})"
-
-    if full_name:
-        return full_name
-
     if username:
-        return f"@{username}"
+        return f"{full_name} (@{username})" if full_name else f"@{username}"
 
-    return f"User ID: {user.id}"
+    return full_name or f"User ID: {user.id}"
 
 
 def get_database_display_name(user_id):
-    """Get a registered user's name from the database."""
-
     user = get_user(user_id)
 
     if not user:
@@ -58,16 +56,15 @@ def get_database_display_name(user_id):
 
 
 def get_referral_link(user_id):
-    """Generate a personal referral link."""
+    me = bot.get_me()
+    return f"https://t.me/{me.username}?start={user_id}"
 
-    bot_username = bot.get_me().username
 
-    return f"https://t.me/{bot_username}?start={user_id}"
-
+# =====================================================
+# REFERRAL KEYBOARD
+# =====================================================
 
 def create_referral_keyboard(user_id):
-    """Create the referral menu keyboard."""
-
     keyboard = types.InlineKeyboardMarkup(row_width=1)
 
     referral_link = get_referral_link(user_id)
@@ -79,8 +76,8 @@ def create_referral_keyboard(user_id):
 
     share_url = (
         "https://t.me/share/url"
-        f"?url={referral_link}"
-        f"&text={share_text.replace(' ', '%20')}"
+        f"?url={quote(referral_link, safe='')}"
+        f"&text={quote(share_text, safe='')}"
     )
 
     keyboard.add(
@@ -92,7 +89,7 @@ def create_referral_keyboard(user_id):
 
     keyboard.add(
         types.InlineKeyboardButton(
-            "🔄 Refresh Stats",
+            "🔄 Refresh Statistics",
             callback_data="refresh_referral",
         )
     )
@@ -107,31 +104,34 @@ def create_referral_keyboard(user_id):
     return keyboard
 
 
-def build_referral_text(user_id):
-    """Build the referral statistics message."""
+# =====================================================
+# REFERRAL STATISTICS MESSAGE
+# =====================================================
 
+def build_referral_text(user_id):
     stats = get_user_stats(user_id)
 
     if not stats:
         return None
 
     referral_link = get_referral_link(user_id)
+    safe_link = escape(referral_link)
 
     return (
-        "💰 REFER & EARN\n\n"
-        "🔗 Your Referral Link:\n"
-        f"{referral_link}\n\n"
-        "📊 YOUR STATISTICS\n\n"
-        f"👥 Today's Referrals: "
-        f"{stats['today_referrals']}\n"
-        f"🪙 Today's Coins: "
-        f"{stats['today_coins']}\n\n"
-        f"🌐 Lifetime Referrals: "
-        f"{stats['lifetime_referrals']}\n"
-        f"💎 Lifetime Coins: "
-        f"{stats['lifetime_coins']}\n\n"
-        f"🎁 Reward: {REFERRAL_REWARD} coins per valid referral\n\n"
-        "🔒 Each user can be referred only once."
+        "💰 <b>REFER &amp; EARN</b>\n\n"
+        "<b>Your Personal Referral Link</b>\n"
+        f"<code>{safe_link}</code>\n\n"
+        "<b>Your Daily Statistics</b>\n"
+        f"👥 Referrals: <b>{stats['today_referrals']}</b>\n"
+        f"🪙 Coins: <b>{stats['today_coins']}</b>\n\n"
+        "<b>Your Lifetime Statistics</b>\n"
+        f"🌐 Total Referrals: <b>{stats['lifetime_referrals']}</b>\n"
+        f"💎 Total Coins: <b>{stats['lifetime_coins']}</b>\n\n"
+        "<b>Referral Rewards</b>\n"
+        f"👤 Referrer: <b>{REFERRAL_REWARD} coins</b>\n"
+        f"🎁 New user: <b>{REFERRED_USER_REWARD} coins</b>\n\n"
+        "Rewards are credited after successful membership "
+        "verification. Each user can be referred only once."
     )
 
 
@@ -145,7 +145,6 @@ def register_referral_handlers():
         func=lambda call: call.data == "refer_earn"
     )
     def refer_earn_callback(call):
-
         user_id = call.from_user.id
 
         stats_text = build_referral_text(user_id)
@@ -163,6 +162,7 @@ def register_referral_handlers():
         bot.send_message(
             call.message.chat.id,
             stats_text,
+            parse_mode="HTML",
             reply_markup=create_referral_keyboard(user_id),
             disable_web_page_preview=True,
         )
@@ -171,7 +171,6 @@ def register_referral_handlers():
         func=lambda call: call.data == "refresh_referral"
     )
     def refresh_referral_callback(call):
-
         user_id = call.from_user.id
 
         stats_text = build_referral_text(user_id)
@@ -186,7 +185,7 @@ def register_referral_handlers():
 
         bot.answer_callback_query(
             call.id,
-            "Statistics updated!",
+            "Statistics updated.",
         )
 
         try:
@@ -194,53 +193,49 @@ def register_referral_handlers():
                 stats_text,
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
+                parse_mode="HTML",
                 reply_markup=create_referral_keyboard(user_id),
                 disable_web_page_preview=True,
             )
 
         except Exception as error:
-            # Telegram may report that the message is unchanged.
             if "message is not modified" not in str(error).lower():
-                print(
-                    f"Referral stats refresh error: {error}"
-                )
+                print(f"[REFERRAL] Refresh error: {error}")
 
 
 # =====================================================
-# PROCESS REFERRAL FROM /START
+# PROCESS VERIFIED REFERRAL
 # =====================================================
 
 def process_start_referral(message, referrer_id):
     """
-    Process a referral from a /start referral payload.
+    Called by start.py after membership verification.
 
-    Requirements:
-    - The referrer must already be registered.
-    - The referred user can only be credited once.
-    - Self-referrals are rejected.
-    - Notifications are sent only after successful credit.
+    The database transaction awards the referrer and
+    referred user together. Notifications are sent only
+    after a successful database credit.
     """
 
-    referred_user_id = message.from_user.id
+    referred_user = message.from_user
+    referred_user_id = referred_user.id
 
-    # Reject self-referrals.
     if referrer_id == referred_user_id:
         return False
 
-    # Referrer must already exist.
     referrer = get_user(referrer_id)
 
     if not referrer:
+        print(f"[REFERRAL] Referrer not found: {referrer_id}")
         return False
 
-    # Register the referred user if they are new.
+    # Keep the user's stored profile up to date.
     register_user(
         user_id=referred_user_id,
-        first_name=message.from_user.first_name or "",
-        username=message.from_user.username,
+        first_name=referred_user.first_name or "",
+        username=referred_user.username,
     )
 
-    # Credit the referral exactly once in the database.
+    # The caller must have verified required memberships.
     success, result_message = process_referral(
         referrer_id=referrer_id,
         referred_user_id=referred_user_id,
@@ -248,29 +243,30 @@ def process_start_referral(message, referrer_id):
 
     if not success:
         print(
-            f"Referral not credited: "
+            f"[REFERRAL] Not credited: "
             f"{referrer_id} -> {referred_user_id}: "
             f"{result_message}"
         )
         return False
 
-    # Names for notifications.
-    referrer_name = get_database_display_name(
-        referrer_id
+    referrer_name = escape(
+        get_database_display_name(referrer_id)
     )
 
-    referred_name = get_display_name(
-        message.from_user
+    referred_name = escape(
+        get_display_name(referred_user)
     )
 
     # -------------------------------------------------
-    # NOTIFICATION 1: REFERRED USER
+    # NOTIFY REFERRED USER
     # -------------------------------------------------
 
     referred_notification = (
-        "🎉 WELCOME!\n\n"
-        "Your referral has been recorded successfully.\n\n"
-        f"👤 Referred By: {referrer_name}\n\n"
+        "🎉 <b>REFERRAL VERIFIED</b>\n\n"
+        f"You were referred by <b>{referrer_name}</b>.\n\n"
+        f"🪙 <b>+{REFERRED_USER_REWARD} coins</b> "
+        "have been added to your balance.\n\n"
+        "Your referral has been recorded successfully. "
         "Good luck in the Daily Referral Competition!"
     )
 
@@ -278,34 +274,38 @@ def process_start_referral(message, referrer_id):
         bot.send_message(
             referred_user_id,
             referred_notification,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
         )
     except Exception as error:
         print(
-            f"Could not notify referred user "
+            f"[REFERRAL] Could not notify referred user "
             f"{referred_user_id}: {error}"
         )
 
     # -------------------------------------------------
-    # NOTIFICATION 2: REFERRER
+    # NOTIFY REFERRER
     # -------------------------------------------------
 
     referrer_notification = (
-        "🎉 NEW REFERRAL!\n\n"
-        f"👤 New User: {referred_name}\n"
-        f"🪙 Reward Earned: +{REFERRAL_REWARD} Coins\n\n"
-        f"✅ {REFERRAL_REWARD} coins have been added "
-        "to your balance.\n\n"
-        "Keep inviting friends to earn more coins!"
+        "🎉 <b>NEW VERIFIED REFERRAL</b>\n\n"
+        f"👤 New user: <b>{referred_name}</b>\n"
+        f"🪙 Reward: <b>+{REFERRAL_REWARD} coins</b>\n\n"
+        "The reward has been added to your balance.\n\n"
+        "Keep inviting new users to improve your "
+        "daily competition ranking."
     )
 
     try:
         bot.send_message(
             referrer_id,
             referrer_notification,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
         )
     except Exception as error:
         print(
-            f"Could not notify referrer "
+            f"[REFERRAL] Could not notify referrer "
             f"{referrer_id}: {error}"
         )
 
