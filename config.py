@@ -22,7 +22,7 @@ ADMIN_IDS = [
 # 🪙 REFERRAL SETTINGS
 # =====================================================
 
-WELCOME_BONUS = 0
+WELCOME_BONUS = 5
 REFERRAL_REWARD = 10
 
 
