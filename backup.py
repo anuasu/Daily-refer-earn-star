@@ -1,35 +1,72 @@
 import os
 import sqlite3
 import shutil
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from config import DATABASE_FILE, BACKUP_DIR, TIMEZONE
+from config import (
+    DATABASE_FILE,
+    BACKUP_DIR,
+    TIMEZONE,
+)
 
 
-def get_timestamp():
-    return datetime.now(
-        ZoneInfo(TIMEZONE)
-    ).strftime("%Y-%m-%d_%H-%M-%S")
+# =====================================================
+# CONFIGURATION
+# =====================================================
+
+logger = logging.getLogger(__name__)
+TZ = ZoneInfo(TIMEZONE)
 
 
-def create_backup():
-    """
-    Create a consistent SQLite backup.
-    Returns the backup file path.
-    """
+# =====================================================
+# PATH HELPERS
+# =====================================================
 
-    if not os.path.exists(DATABASE_FILE):
-        raise FileNotFoundError(
-            f"Database not found: {DATABASE_FILE}"
-        )
+def ensure_directories():
+    database_directory = os.path.dirname(DATABASE_FILE)
+
+    if database_directory:
+        os.makedirs(database_directory, exist_ok=True)
 
     os.makedirs(BACKUP_DIR, exist_ok=True)
 
-    timestamp = get_timestamp()
-    backup_path = os.path.join(
-        BACKUP_DIR,
-        f"database_backup_{timestamp}.db",
+
+def get_timestamp():
+    return datetime.now(TZ).strftime(
+        "%Y-%m-%d_%H-%M-%S_%f"
+    )
+
+
+def get_database_path():
+    return os.path.abspath(DATABASE_FILE)
+
+
+# =====================================================
+# BACKUP CREATION
+# =====================================================
+
+def create_backup():
+    """
+    Create a consistent SQLite backup without copying
+    the active database file directly.
+    """
+
+    ensure_directories()
+
+    database_path = get_database_path()
+
+    if not os.path.isfile(database_path):
+        raise FileNotFoundError(
+            f"Database file does not exist: {database_path}"
+        )
+
+    backup_path = os.path.abspath(
+        os.path.join(
+            BACKUP_DIR,
+            f"database_backup_{get_timestamp()}.db",
+        )
     )
 
     source = None
@@ -37,7 +74,7 @@ def create_backup():
 
     try:
         source = sqlite3.connect(
-            DATABASE_FILE,
+            database_path,
             timeout=30,
         )
 
@@ -55,56 +92,97 @@ def create_backup():
 
         if not result or result[0] != "ok":
             raise RuntimeError(
-                "Backup integrity check failed."
+                f"Backup integrity check failed: {result}"
             )
+
+        logger.info("Database backup created: %s", backup_path)
 
         return backup_path
 
     except Exception:
         if os.path.exists(backup_path):
-            os.remove(backup_path)
+            try:
+                os.remove(backup_path)
+            except OSError:
+                logger.exception(
+                    "Could not remove failed backup: %s",
+                    backup_path,
+                )
+
         raise
 
     finally:
-        if destination:
+        if destination is not None:
             destination.close()
 
-        if source:
+        if source is not None:
             source.close()
 
 
-def list_backups():
-    """Return available database backups, newest first."""
+# =====================================================
+# LIST BACKUPS
+# =====================================================
 
-    if not os.path.isdir(BACKUP_DIR):
-        return []
+def list_backups():
+    ensure_directories()
 
     backups = []
 
     for filename in os.listdir(BACKUP_DIR):
-        if (
+        if not (
             filename.startswith("database_backup_")
             and filename.endswith(".db")
         ):
-            path = os.path.join(BACKUP_DIR, filename)
+            continue
 
-            if os.path.isfile(path):
-                backups.append({
-                    "filename": filename,
-                    "path": path,
-                    "size_bytes": os.path.getsize(path),
-                    "modified": os.path.getmtime(path),
-                })
+        path = os.path.abspath(
+            os.path.join(BACKUP_DIR, filename)
+        )
 
-    return sorted(
-        backups,
+        if not os.path.isfile(path):
+            continue
+
+        try:
+            stat = os.stat(path)
+
+            backups.append({
+                "filename": filename,
+                "path": path,
+                "size_bytes": stat.st_size,
+                "modified": datetime.fromtimestamp(
+                    stat.st_mtime,
+                    TZ,
+                ).isoformat(timespec="seconds"),
+            })
+
+        except OSError:
+            logger.exception(
+                "Could not inspect backup: %s",
+                path,
+            )
+
+    backups.sort(
         key=lambda item: item["modified"],
         reverse=True,
     )
 
+    return backups
+
+
+# =====================================================
+# BACKUP VALIDATION
+# =====================================================
 
 def validate_backup(backup_path):
-    """Check that a backup is a valid SQLite database."""
+    """
+    Return True only when the backup is a valid SQLite
+    database containing the essential application tables.
+    """
+
+    if not backup_path:
+        return False
+
+    backup_path = os.path.abspath(backup_path)
 
     if not os.path.isfile(backup_path):
         return False
@@ -112,10 +190,17 @@ def validate_backup(backup_path):
     connection = None
 
     try:
+        # Open read-only; never modify a backup while validating.
+        uri = (
+            "file:"
+            + backup_path.replace("\\", "/")
+            + "?mode=ro"
+        )
+
         connection = sqlite3.connect(
-            f"file:{os.path.abspath(backup_path)}?mode=ro",
+            uri,
             uri=True,
-            timeout=30,
+            timeout=10,
         )
 
         result = connection.execute(
@@ -125,55 +210,87 @@ def validate_backup(backup_path):
         if not result or result[0] != "ok":
             return False
 
-        tables = connection.execute(
-            """
-            SELECT name
-            FROM sqlite_master
-            WHERE type = 'table'
-            """
-        ).fetchall()
+        tables = {
+            row[0]
+            for row in connection.execute("""
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+            """).fetchall()
+        }
 
-        table_names = {row[0] for row in tables}
+        required_tables = {
+            "users",
+            "referrals",
+            "daily_stats",
+        }
 
-        return "users" in table_names
+        return required_tables.issubset(tables)
 
-    except sqlite3.Error:
+    except (sqlite3.Error, OSError, ValueError):
+        logger.exception(
+            "Backup validation failed: %s",
+            backup_path,
+        )
         return False
 
     finally:
-        if connection:
+        if connection is not None:
             connection.close()
 
 
+# =====================================================
+# RESTORE
+# =====================================================
+
 def restore_backup(backup_path):
     """
-    Restore a valid backup.
+    Restore a validated backup.
 
-    Creates a backup of the current database first.
-    Returns True when restoration succeeds.
+    SAFETY:
+    Stop the bot before calling this function. This function
+    cannot guarantee that another process has no active
+    database connections.
     """
+
+    ensure_directories()
+
+    backup_path = os.path.abspath(backup_path)
+    database_path = get_database_path()
 
     if not validate_backup(backup_path):
         raise ValueError(
-            "Invalid backup or required users table missing."
+            "Backup validation failed. Restore cancelled."
         )
 
-    os.makedirs(
-        os.path.dirname(DATABASE_FILE) or ".",
-        exist_ok=True,
-    )
+    if backup_path == database_path:
+        raise ValueError(
+            "Cannot restore the active database as its own backup."
+        )
 
-    if os.path.exists(DATABASE_FILE):
-        create_backup()
-
-    temporary_path = DATABASE_FILE + ".restore_tmp"
+    temporary_path = database_path + ".restore_tmp"
+    safety_backup_path = None
 
     source = None
     destination = None
 
     try:
+        # Preserve current database before restoration.
+        if os.path.isfile(database_path):
+            safety_backup_path = create_backup()
+
+        # Build the restored database separately.
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+        source_uri = (
+            "file:"
+            + backup_path.replace("\\", "/")
+            + "?mode=ro"
+        )
+
         source = sqlite3.connect(
-            f"file:{os.path.abspath(backup_path)}?mode=ro",
+            source_uri,
             uri=True,
             timeout=30,
         )
@@ -192,7 +309,7 @@ def restore_backup(backup_path):
 
         if not result or result[0] != "ok":
             raise RuntimeError(
-                "Restored database failed integrity check."
+                "Restored temporary database failed integrity check."
             )
 
         destination.close()
@@ -201,40 +318,62 @@ def restore_backup(backup_path):
         source.close()
         source = None
 
-        shutil.move(
-            temporary_path,
-            DATABASE_FILE,
+        # Replace the main DB only after the temporary copy
+        # has passed integrity checking.
+        shutil.move(temporary_path, database_path)
+
+        logger.warning(
+            "Database restored from %s. Safety backup: %s",
+            backup_path,
+            safety_backup_path,
         )
 
         return True
 
     except Exception:
+        logger.exception("Database restore failed.")
+
         if os.path.exists(temporary_path):
-            os.remove(temporary_path)
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                logger.exception(
+                    "Could not remove temporary restore file."
+                )
+
         raise
 
     finally:
-        if destination:
+        if destination is not None:
             destination.close()
 
-        if source:
+        if source is not None:
             source.close()
 
 
+# =====================================================
+# DELETE OLD BACKUPS
+# =====================================================
+
 def delete_old_backups(keep=30):
-    """Keep the newest backups and remove older local copies."""
+    """
+    Keep the newest `keep` backups.
+    Returns the number of files deleted.
+    """
 
-    if keep < 1:
-        raise ValueError("keep must be at least 1.")
-
+    keep = max(1, int(keep))
     backups = list_backups()
-    deleted = []
+    deleted = 0
 
     for backup in backups[keep:]:
         try:
             os.remove(backup["path"])
-            deleted.append(backup["path"])
+            deleted += 1
+
         except OSError:
-            continue
+            logger.exception(
+                "Could not delete old backup: %s",
+                backup["path"],
+            )
 
     return deleted
