@@ -10,11 +10,6 @@ from config import (
     TIMEZONE,
 )
 
-
-# =====================================================
-# CONFIGURATION
-# =====================================================
-
 TZ = ZoneInfo(TIMEZONE)
 REFEREE_REWARD = 5
 
@@ -54,7 +49,7 @@ def get_connection():
 
 
 # =====================================================
-# SAFE MIGRATIONS
+# SAFE DATABASE MIGRATIONS
 # =====================================================
 
 def _ensure_column(conn, table, column, definition):
@@ -73,11 +68,12 @@ def _ensure_column(conn, table, column, definition):
 
 
 # =====================================================
-# DATABASE INITIALIZATION
+# INITIALIZE DATABASE
 # =====================================================
 
 def init_db():
     with get_connection() as conn:
+
         conn.execute("PRAGMA journal_mode = WAL")
 
         conn.execute("""
@@ -103,7 +99,6 @@ def init_db():
             )
         """)
 
-        # Existing users must not receive a retroactive bonus.
         _ensure_column(
             conn, "users",
             "welcome_bonus_claimed",
@@ -163,7 +158,7 @@ def init_db():
                 user_id INTEGER NOT NULL,
                 referrals INTEGER NOT NULL DEFAULT 0,
                 coins INTEGER NOT NULL DEFAULT 0,
-                reward_stars INTEGER NOT NULL DEFAULT 50,
+                reward_stars INTEGER NOT NULL DEFAULT 15,
                 reward_status TEXT NOT NULL DEFAULT 'PENDING',
                 announced INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
@@ -177,11 +172,16 @@ def init_db():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS competition_runs (
                 competition_date TEXT PRIMARY KEY,
-                status TEXT NOT NULL DEFAULT 'RUNNING',
-                started_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                started_at TEXT,
                 completed_at TEXT,
                 backup_path TEXT,
-                announcement_sent INTEGER NOT NULL DEFAULT 0
+                announcement_sent INTEGER NOT NULL DEFAULT 0,
+                announcement_message_id INTEGER,
+                finalized_at TEXT,
+                announced_at TEXT,
+                reset_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT ''
             )
         """)
 
@@ -195,7 +195,7 @@ def init_db():
         conn.execute("""
             INSERT OR IGNORE INTO bot_settings
             (setting_key, setting_value)
-            VALUES ('schema_version', '2')
+            VALUES ('schema_version', '3')
         """)
 
         conn.execute("""
@@ -337,7 +337,10 @@ def register_user(user_id, first_name="", username=None):
                 """, (bonus, bonus, user_id))
 
                 _credit_daily_coins(
-                    conn, user_id, bonus, today
+                    conn,
+                    user_id,
+                    bonus,
+                    today,
                 )
 
     return get_user(user_id)
@@ -544,10 +547,17 @@ def process_referral(referrer_id, referred_user_id):
                     coins = coins + ?
                 WHERE user_id = ?
                   AND competition_date = ?
-            """, (referrer_reward, referrer_id, today))
+            """, (
+                referrer_reward,
+                referrer_id,
+                today,
+            ))
 
             _credit_daily_coins(
-                conn, referred_user_id, referred_reward, today
+                conn,
+                referred_user_id,
+                referred_reward,
+                today,
             )
 
             return True, "Referral credited successfully."
@@ -656,61 +666,59 @@ def get_user_stats(user_id):
 # =====================================================
 
 def get_top_users(limit=50):
-    today = current_date()
-
     with get_connection() as conn:
         return conn.execute("""
             SELECT
-                u.user_id,
-                u.first_name,
-                u.username,
-                d.referrals,
-                d.coins
-            FROM daily_stats AS d
-            JOIN users AS u ON u.user_id = d.user_id
-            WHERE d.competition_date = ?
-              AND u.is_banned = 0
-            ORDER BY d.coins DESC, d.referrals DESC, u.user_id ASC
+                user_id,
+                first_name,
+                username,
+                daily_referrals AS referrals,
+                daily_coins AS coins
+            FROM users
+            WHERE is_banned = 0
+            ORDER BY
+                daily_coins DESC,
+                daily_referrals DESC,
+                user_id ASC
             LIMIT ?
-        """, (today, max(1, int(limit)))).fetchall()
+        """, (max(1, int(limit)),)).fetchall()
 
 
 # =====================================================
-# DAILY RESET
+# RESET ONLY WINNERS' DAILY COINS
 # =====================================================
 
-def reset_daily_coins():
+def reset_daily_coins(winner_ids=None):
     """
-    Reset only current daily user counters.
-    Lifetime balances and historical competition rows
-    remain untouched.
+    Reset daily coins for winners only.
 
-    Scheduler must ensure this is executed only once
-    after the previous day's results are safely published.
+    Referral counts, lifetime balances and referral history
+    are never reset by this function.
     """
 
-    today = current_date()
+    ids = sorted({
+        int(user_id)
+        for user_id in (winner_ids or [])
+    })
+
+    if not ids:
+        return 0
 
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
 
-        conn.execute("""
-            UPDATE users
-            SET daily_referrals = 0,
-                daily_coins = 0,
-                daily_date = ?
-        """, (today,))
+        placeholders = ",".join("?" for _ in ids)
 
-        conn.execute("""
-            INSERT OR IGNORE INTO daily_stats (
-                user_id,
-                competition_date,
-                referrals,
-                coins
-            )
-            SELECT user_id, ?, 0, 0
-            FROM users
-        """, (today,))
+        cursor = conn.execute(
+            f"""
+            UPDATE users
+            SET daily_coins = 0
+            WHERE user_id IN ({placeholders})
+            """,
+            ids,
+        )
+
+        return cursor.rowcount
 
 
 # =====================================================
