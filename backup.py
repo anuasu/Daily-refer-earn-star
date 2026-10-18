@@ -1,10 +1,9 @@
 import os
 import sqlite3
 import logging
-import shutil
 import tempfile
-from datetime import datetime
 from pathlib import Path
+from datetime import datetime
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -12,69 +11,106 @@ from config import DATABASE_FILE, BACKUP_DIR, TIMEZONE
 
 
 logger = logging.getLogger(__name__)
-TZ = ZoneInfo(TIMEZONE)
 
-REQUIRED_TABLES = {"users", "referrals", "daily_stats"}
+REQUIRED_TABLES = {
+    "users",
+    "referrals",
+    "daily_stats",
+}
 
-
-# =====================================================
-# PATH HELPERS
-# =====================================================
-
-def ensure_directories():
-    Path(DATABASE_FILE).parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    Path(BACKUP_DIR).mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+BACKUP_PREFIX = "database_backup_"
+BACKUP_EXTENSION = ".db"
 
 
-def get_timestamp():
-    return datetime.now(TZ).strftime(
-        "%Y-%m-%d_%H-%M-%S_%f"
-    )
-
+# =========================================================
+# PATHS & DIRECTORIES
+# =========================================================
 
 def get_database_path():
     return os.path.abspath(DATABASE_FILE)
 
 
-def _readonly_uri(path):
-    absolute_path = os.path.abspath(path)
-    return "file:" + quote(absolute_path, safe="/:") + "?mode=ro"
+def get_backup_directory():
+    return os.path.abspath(BACKUP_DIR)
 
 
-def _connect_readonly(path, timeout=30):
-    return sqlite3.connect(
-        _readonly_uri(path),
-        uri=True,
-        timeout=timeout,
+def ensure_directories():
+    os.makedirs(
+        os.path.dirname(get_database_path()) or ".",
+        exist_ok=True,
+    )
+
+    os.makedirs(
+        get_backup_directory(),
+        exist_ok=True,
     )
 
 
-# =====================================================
-# DATABASE VALIDATION
-# =====================================================
+def get_timestamp():
+    try:
+        timezone = ZoneInfo(TIMEZONE)
+    except Exception:
+        timezone = ZoneInfo("Asia/Kolkata")
 
-def _check_database(path):
+    return datetime.now(timezone).strftime(
+        "%Y-%m-%d_%H-%M-%S_%f"
+    )
+
+
+def get_backup_filename():
+    return (
+        f"{BACKUP_PREFIX}"
+        f"{get_timestamp()}"
+        f"{BACKUP_EXTENSION}"
+    )
+
+
+# =========================================================
+# SQLITE CONNECTION HELPERS
+# =========================================================
+
+def readonly_connection(path):
+    absolute_path = os.path.abspath(path)
+
+    uri = (
+        "file:"
+        + quote(absolute_path, safe="/:")
+        + "?mode=ro"
+    )
+
+    return sqlite3.connect(
+        uri,
+        uri=True,
+        timeout=30,
+    )
+
+
+def check_database(path):
     """
-    Check SQLite integrity and essential application tables.
-    Does not modify the database.
+    Check SQLite integrity and required tables.
+    Returns True if the database is valid, otherwise False.
     """
+
+    if not os.path.isfile(path):
+        return False
+
+    if os.path.getsize(path) == 0:
+        return False
+
     connection = None
 
     try:
-        connection = _connect_readonly(path)
+        connection = readonly_connection(path)
 
-        result = connection.execute(
+        integrity = connection.execute(
             "PRAGMA integrity_check"
         ).fetchone()
 
-        if not result or result[0] != "ok":
+        if not integrity or integrity[0] != "ok":
+            logger.error(
+                "SQLite integrity check failed: %s",
+                path,
+            )
             return False
 
         tables = {
@@ -86,10 +122,20 @@ def _check_database(path):
             """).fetchall()
         }
 
-        return REQUIRED_TABLES.issubset(tables)
+        if not REQUIRED_TABLES.issubset(tables):
+            logger.error(
+                "Database is missing required tables: %s",
+                path,
+            )
+            return False
 
-    except (sqlite3.Error, OSError, ValueError):
-        logger.exception("Database validation failed: %s", path)
+        return True
+
+    except Exception:
+        logger.exception(
+            "Database validation failed: %s",
+            path,
+        )
         return False
 
     finally:
@@ -97,40 +143,68 @@ def _check_database(path):
             connection.close()
 
 
+# =========================================================
+# VALIDATE BACKUP
+# =========================================================
+
 def validate_backup(backup_path):
+    """
+    Validate a backup file.
+
+    Compatible with admin.py, which expects True or False.
+    """
+
     if not backup_path:
         return False
 
-    backup_path = os.path.abspath(str(backup_path))
+    try:
+        path = os.path.abspath(str(backup_path))
 
-    if not os.path.isfile(backup_path):
+        if not os.path.isfile(path):
+            return False
+
+        if os.path.getsize(path) == 0:
+            return False
+
+        return check_database(path)
+
+    except Exception:
+        logger.exception("Could not validate backup.")
         return False
 
-    if os.path.getsize(backup_path) == 0:
-        return False
 
-    return _check_database(backup_path)
-
-
-# =====================================================
+# =========================================================
 # CREATE BACKUP
-# =====================================================
+# =========================================================
 
 def create_backup():
+    """
+    Create a consistent SQLite backup.
+
+    Returns:
+        Absolute backup path on success.
+
+    Raises:
+        Exception if backup creation fails.
+    """
+
     ensure_directories()
 
     database_path = get_database_path()
 
     if not os.path.isfile(database_path):
         raise FileNotFoundError(
-            f"Database file does not exist: {database_path}"
+            f"Database file not found: {database_path}"
         )
 
-    backup_path = os.path.abspath(
-        os.path.join(
-            BACKUP_DIR,
-            f"database_backup_{get_timestamp()}.db",
+    if not check_database(database_path):
+        raise sqlite3.DatabaseError(
+            "The current database failed validation."
         )
+
+    backup_path = os.path.join(
+        get_backup_directory(),
+        get_backup_filename(),
     )
 
     source = None
@@ -147,27 +221,39 @@ def create_backup():
             timeout=30,
         )
 
+        # SQLite backup API creates a consistent snapshot.
         source.backup(destination)
+
         destination.commit()
 
-        result = destination.execute(
-            "PRAGMA integrity_check"
-        ).fetchone()
+        destination.close()
+        destination = None
 
-        if not result or result[0] != "ok":
-            raise RuntimeError(
-                "Created backup failed SQLite integrity check."
+        source.close()
+        source = None
+
+        if not validate_backup(backup_path):
+            raise sqlite3.DatabaseError(
+                "Created backup failed validation."
             )
 
-        logger.info("Database backup created: %s", backup_path)
-        return backup_path
+        logger.info(
+            "Database backup created successfully: %s",
+            backup_path,
+        )
+
+        return os.path.abspath(backup_path)
 
     except Exception:
+        logger.exception("Backup creation failed.")
+
         if os.path.exists(backup_path):
             try:
                 os.remove(backup_path)
             except OSError:
-                logger.exception("Could not remove failed backup.")
+                logger.exception(
+                    "Could not remove incomplete backup."
+                )
 
         raise
 
@@ -179,106 +265,137 @@ def create_backup():
             source.close()
 
 
-# =====================================================
-# LIST BACKUPS
-# =====================================================
+# =========================================================
+# LIST AVAILABLE BACKUPS
+# =========================================================
 
 def list_backups():
+    """
+    Returns a newest-first list of dictionaries.
+
+    Each entry contains:
+        filename
+        path
+        size_bytes
+        modified
+
+    Compatible with the current admin.py.
+    """
+
     ensure_directories()
+
+    backup_directory = Path(get_backup_directory())
     backups = []
 
-    for filename in os.listdir(BACKUP_DIR):
-        if not (
-            filename.startswith("database_backup_")
-            and filename.endswith(".db")
-        ):
-            continue
+    try:
+        for item in backup_directory.iterdir():
 
-        path = os.path.abspath(
-            os.path.join(BACKUP_DIR, filename)
+            if not item.is_file():
+                continue
+
+            if not item.name.startswith(BACKUP_PREFIX):
+                continue
+
+            if item.suffix.lower() != BACKUP_EXTENSION:
+                continue
+
+            try:
+                size = item.stat().st_size
+                modified = item.stat().st_mtime
+
+                if size <= 0:
+                    continue
+
+                backups.append({
+                    "filename": item.name,
+                    "path": str(item.resolve()),
+                    "size_bytes": size,
+                    "modified": modified,
+                })
+
+            except OSError:
+                logger.exception(
+                    "Could not read backup metadata: %s",
+                    item,
+                )
+
+        backups.sort(
+            key=lambda backup: backup["modified"],
+            reverse=True,
         )
 
-        if not os.path.isfile(path):
-            continue
+        return backups
 
-        try:
-            stat = os.stat(path)
-
-            backups.append({
-                "filename": filename,
-                "path": path,
-                "size_bytes": stat.st_size,
-                "modified": datetime.fromtimestamp(
-                    stat.st_mtime,
-                    TZ,
-                ).isoformat(timespec="seconds"),
-            })
-
-        except OSError:
-            logger.exception("Could not inspect backup: %s", path)
-
-    backups.sort(
-        key=lambda item: item["modified"],
-        reverse=True,
-    )
-
-    return backups
+    except Exception:
+        logger.exception("Could not list database backups.")
+        return []
 
 
-# =====================================================
-# RESTORE DATABASE
-# =====================================================
+# =========================================================
+# RESTORE BACKUP
+# =========================================================
 
 def restore_backup(backup_path):
     """
-    Restore a validated SQLite backup.
+    Restore a validated backup to the active database.
+
+    Returns True on success.
 
     IMPORTANT:
-    Stop the bot before restoring. Other processes must not
-    have active connections to the database.
+    Stop the bot before restoring so other processes do not
+    continue writing to the database.
     """
 
-    ensure_directories()
-
     if not backup_path:
-        raise ValueError("No backup file was provided.")
+        raise ValueError("No backup path provided.")
 
-    backup_path = os.path.realpath(str(backup_path))
-    database_path = os.path.realpath(get_database_path())
+    source_path = os.path.realpath(
+        os.path.abspath(str(backup_path))
+    )
 
-    if not os.path.isfile(backup_path):
-        raise FileNotFoundError("The selected backup file was not found.")
+    database_path = os.path.realpath(
+        get_database_path()
+    )
 
-    if backup_path == database_path:
-        raise ValueError("Cannot restore the active database itself.")
-
-    if not validate_backup(backup_path):
+    if source_path == database_path:
         raise ValueError(
-            "The selected file is not a valid application database backup."
+            "Cannot restore the active database as a backup."
         )
 
-    database_directory = os.path.dirname(database_path)
-    temporary_path = None
-    safety_backup_path = None
+    if not validate_backup(source_path):
+        raise sqlite3.DatabaseError(
+            "Backup is invalid or corrupted."
+        )
 
+    database_directory = os.path.dirname(database_path) or "."
+    os.makedirs(database_directory, exist_ok=True)
+
+    # Preserve the current database before replacing it.
+    if os.path.isfile(database_path):
+        safety_backup = create_backup()
+
+        logger.info(
+            "Safety backup created before restore: %s",
+            safety_backup,
+        )
+
+    temporary_path = None
     source = None
     destination = None
 
     try:
-        # Save the current database before replacing it.
-        if os.path.isfile(database_path):
-            safety_backup_path = create_backup()
-
-        # Create the temporary database in the SAME directory
-        # so os.replace() remains on the same filesystem.
-        file_descriptor, temporary_path = tempfile.mkstemp(
-            prefix=".restore_",
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix="database_restore_",
             suffix=".db",
             dir=database_directory,
         )
-        os.close(file_descriptor)
 
-        source = _connect_readonly(backup_path)
+        os.close(descriptor)
+
+        source = sqlite3.connect(
+            source_path,
+            timeout=30,
+        )
 
         destination = sqlite3.connect(
             temporary_path,
@@ -288,41 +405,34 @@ def restore_backup(backup_path):
         source.backup(destination)
         destination.commit()
 
-        result = destination.execute(
-            "PRAGMA integrity_check"
-        ).fetchone()
-
-        if not result or result[0] != "ok":
-            raise RuntimeError(
-                "Restored temporary database failed integrity check."
-            )
-
         destination.close()
         destination = None
 
         source.close()
         source = None
 
-        if not _check_database(temporary_path):
-            raise RuntimeError(
-                "Restored database is missing required tables."
+        if not validate_backup(temporary_path):
+            raise sqlite3.DatabaseError(
+                "Restored temporary database failed validation."
             )
 
-        # Atomic replacement of the main database file.
-        # This is safe only when the bot and other DB users are stopped.
-        os.replace(temporary_path, database_path)
+        # Replace the active database only after validation.
+        os.replace(
+            temporary_path,
+            database_path,
+        )
+
         temporary_path = None
 
         logger.warning(
-            "Database restored from %s. Safety backup: %s",
-            backup_path,
-            safety_backup_path,
+            "Database restored successfully from: %s",
+            source_path,
         )
 
         return True
 
     except Exception:
-        logger.exception("Database restore failed.")
+        logger.exception("Database restoration failed.")
         raise
 
     finally:
@@ -341,23 +451,44 @@ def restore_backup(backup_path):
                 )
 
 
-# =====================================================
+# =========================================================
 # DELETE OLD BACKUPS
-# =====================================================
+# =========================================================
 
 def delete_old_backups(keep=30):
-    keep = max(1, int(keep))
+    """
+    Keep the newest `keep` backups and delete older ones.
+
+    Returns the number of deleted files.
+    """
+
+    try:
+        keep = max(1, int(keep))
+    except (TypeError, ValueError):
+        keep = 30
+
     backups = list_backups()
     deleted = 0
 
     for backup in backups[keep:]:
+        path = backup.get("path")
+
+        if not path:
+            continue
+
         try:
-            os.remove(backup["path"])
+            os.remove(path)
             deleted += 1
+
         except OSError:
             logger.exception(
                 "Could not delete old backup: %s",
-                backup["path"],
+                path,
             )
+
+    logger.info(
+        "Old backup cleanup finished. Deleted: %s",
+        deleted,
+    )
 
     return deleted
