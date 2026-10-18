@@ -1,52 +1,42 @@
 import os
 
 # =====================================================
-# 🤖 BOT CONFIGURATION
+# BOT CONFIGURATION
 # =====================================================
 
-BOT_TOKEN = "8533754877:AAFICKC-wTFppzAIZn1NZVyW6z4AkWxVGWc"
-
-
-# =====================================================
-# 👑 ADMIN CONFIGURATION
-# Multiple admins ke liye IDs comma ke bajaye list mein
-# =====================================================
+BOT_TOKEN = "8533754877:AAGJSGagMoismp7NFEs0Aj-UvFCiaa3yvF8"
 
 ADMIN_IDS = [
-    8872609272,  # FAKE_ADMIN_ID_1
-    7672413819,  # FAKE_ADMIN_ID_2
+    8872609272,
+    7672413819,
 ]
 
-
 # =====================================================
-# 🪙 REFERRAL SETTINGS
+# REWARDS
 # =====================================================
 
 WELCOME_BONUS = 5
 REFERRAL_REWARD = 10
-
+STARS_PER_WINNER = 15
 
 # =====================================================
-# 🏆 DAILY COMPETITION SETTINGS
+# TIMEZONE & COMPETITION
 # =====================================================
 
 TIMEZONE = "Asia/Kolkata"
 
 DAILY_WINNERS_COUNT = 10
 LEADERBOARD_LIMIT = 50
-STARS_PER_WINNER = 50
-
 
 # =====================================================
-# 💾 DATABASE & BACKUP SETTINGS
+# DATABASE & BACKUP
 # =====================================================
 
 DATABASE_FILE = "data/users.db"
 BACKUP_DIR = "backups"
 
-
 # =====================================================
-# 📢 REQUIRED CHANNEL / GROUP IDS
+# CHANNEL & GROUP IDS
 # =====================================================
 
 MAIN_CHANNEL_ID = -1003746793908
@@ -55,9 +45,10 @@ EXPOSE_CHANNEL_ID = -1003040006163
 GIVEAWAY_CHANNEL_ID = -1003664665551
 COMMUNITY_GROUP_ID = -1002708620916
 
+RESULTS_CHANNEL_ID = -1003664665551
 
 # =====================================================
-# 🔗 REQUIRED CHANNEL / GROUP LINKS
+# CHANNEL & GROUP LINKS
 # =====================================================
 
 MAIN_CHANNEL_LINK = "https://t.me/anushar_file"
@@ -66,34 +57,29 @@ EXPOSE_CHANNEL_LINK = "https://t.me/ExposeMafia"
 GIVEAWAY_CHANNEL_LINK = "https://t.me/SFgiveaways"
 COMMUNITY_GROUP_LINK = "https://t.me/SfToolGc"
 
-
 # =====================================================
-# 📣 RESULTS CHANNEL
-# =====================================================
-
-RESULTS_CHANNEL_ID = -1003664665551
-
-
-# =====================================================
-# ⚙️ OTHER SETTINGS
+# BOT DETAILS
 # =====================================================
 
 BOT_NAME = "SF DAILY GIFTS"
 BOT_USERNAME = "DaliyRewardBot"
 
-
 # =====================================================
-# 🔒 CONFIGURATION VALIDATION
+# CONFIG VALIDATION
 # =====================================================
 
-if not BOT_TOKEN or BOT_TOKEN == "FAKE_BOT_TOKEN":
+if (
+    not BOT_TOKEN
+    or BOT_TOKEN == "FAKE_BOT_TOKEN"
+    or BOT_TOKEN == "PASTE_YOUR_BOTFATHER_TOKEN_HERE"
+):
     raise RuntimeError(
-        "Please replace FAKE_BOT_TOKEN with your real BotFather token."
+        "Please set your actual BotFather token in config.py."
     )
 
-if not ADMIN_IDS or 123456789 in ADMIN_IDS or 987654321 in ADMIN_IDS:
-    print(
-        "WARNING: Replace the fake admin IDs with your real Telegram IDs."
+if not ADMIN_IDS:
+    raise RuntimeError(
+        "ADMIN_IDS cannot be empty. Add your Telegram admin IDs."
     )
 
-print("Configuration loaded successfully.")
+print("SF DAILY GIFTS configuration loaded successfully.")
