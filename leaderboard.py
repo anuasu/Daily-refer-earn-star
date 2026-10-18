@@ -1,10 +1,13 @@
 from html import escape
+import logging
 
 from telebot import types
 
 from bot_instance import bot
 from database import get_top_users, current_date
 
+
+logger = logging.getLogger(__name__)
 
 LEADERBOARD_LIMIT = 10
 
@@ -15,24 +18,32 @@ def build_leaderboard_text():
     text = (
         "🏆 <b>DAILY REFERRAL LEADERBOARD</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"📅 <b>Date:</b> {current_date()}\n"
+        f"📅 <b>Date:</b> {escape(str(current_date()))}\n"
         "👑 <b>TOP 10 CHAMPIONS</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
     )
 
     if not users:
-        text += "\n<i>No leaderboard activity today. Be the first to earn rewards!</i>"
-        return text
+        return (
+            text
+            + "\n<i>No leaderboard activity today. "
+            "Be the first to earn rewards!</i>"
+        )
 
     for rank, user in enumerate(users, start=1):
         name = escape(str(user["first_name"] or "Unknown"))
 
-        username = user["username"]
+        user_id = int(user["user_id"])
+        username_value = user["username"]
+
         username = (
-            f"@{escape(str(username))}"
-            if username
+            f"@{escape(str(username_value).lstrip('@'))}"
+            if username_value
             else "No username"
         )
+
+        referrals = int(user["referrals"] or 0)
+        coins = int(user["coins"] or 0)
 
         if rank == 1:
             rank_label = "🥇 <b>1ST PLACE</b>"
@@ -45,10 +56,11 @@ def build_leaderboard_text():
 
         text += (
             f"\n{rank_label}\n"
-            f"👤 <b>{name}</b>\n"
-            f"🔹 {username}\n"
-            f"🔗 Referrals: <b>{user['referrals']}</b>\n"
-            f"🪙 Coins: <b>{user['coins']}</b>\n"
+            f"👤 <b>Name:</b> {name}\n"
+            f"🆔 <b>Chat ID:</b> <code>{user_id}</code>\n"
+            f"🔹 <b>Username:</b> {username}\n"
+            f"🔗 <b>Referrals:</b> {referrals}\n"
+            f"🪙 <b>Coins:</b> {coins}\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
         )
 
@@ -73,35 +85,46 @@ def build_leaderboard_keyboard():
 
 
 def show_leaderboard(chat_id, callback_id=None, message_id=None):
-    text = build_leaderboard_text()
-    keyboard = build_leaderboard_keyboard()
-
     if callback_id:
         try:
             bot.answer_callback_query(callback_id)
         except Exception:
-            pass
+            logger.exception("Failed to answer leaderboard callback.")
 
-    if message_id:
-        try:
-            bot.edit_message_text(
-                text,
-                chat_id=chat_id,
-                message_id=message_id,
-                reply_markup=keyboard,
-                parse_mode="HTML",
-            )
-            return
-        except Exception:
-            # Telegram may reject editing when the content is unchanged.
-            pass
+    try:
+        text = build_leaderboard_text()
+        keyboard = build_leaderboard_keyboard()
 
-    bot.send_message(
-        chat_id,
-        text,
-        reply_markup=keyboard,
-        parse_mode="HTML",
-    )
+        if message_id is not None:
+            try:
+                bot.edit_message_text(
+                    text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=keyboard,
+                    parse_mode="HTML",
+                )
+                return
+
+            except Exception as error:
+                # An unchanged message does not need editing.
+                if "message is not modified" in str(error).lower():
+                    return
+
+                logger.warning(
+                    "Leaderboard edit failed: %s",
+                    error,
+                )
+
+        bot.send_message(
+            chat_id,
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+
+    except Exception:
+        logger.exception("Failed to display leaderboard.")
 
 
 def register_leaderboard_handlers():
@@ -110,6 +133,10 @@ def register_leaderboard_handlers():
         func=lambda call: call.data == "leaderboard"
     )
     def leaderboard_callback(call):
+        if not call.message:
+            bot.answer_callback_query(call.id)
+            return
+
         show_leaderboard(
             chat_id=call.message.chat.id,
             callback_id=call.id,
@@ -120,6 +147,10 @@ def register_leaderboard_handlers():
         func=lambda call: call.data == "leaderboard_refresh"
     )
     def leaderboard_refresh_callback(call):
+        if not call.message:
+            bot.answer_callback_query(call.id)
+            return
+
         show_leaderboard(
             chat_id=call.message.chat.id,
             callback_id=call.id,
