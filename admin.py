@@ -1,17 +1,14 @@
 import os
 import time
 import logging
+import tempfile
 from html import escape
 
 from telebot import types
 
 from bot_instance import bot
-from config import ADMIN_IDS
-
-from database import (
-    get_global_stats,
-    get_all_user_ids,
-)
+from config import ADMIN_IDS, BACKUP_DIR
+from database import get_global_stats, get_all_user_ids
 
 from backup import (
     create_backup,
@@ -19,7 +16,6 @@ from backup import (
     validate_backup,
     restore_backup,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -33,21 +29,15 @@ pending_restore = {}
 
 def is_admin(user_id):
     try:
-        return int(user_id) in {
-            int(admin_id) for admin_id in ADMIN_IDS
-        }
+        return int(user_id) in {int(uid) for uid in ADMIN_IDS}
     except (TypeError, ValueError):
         return False
 
 
 def admin_only_message(message):
     if not message.from_user or not is_admin(message.from_user.id):
-        bot.reply_to(
-            message,
-            "⛔ You are not authorized to use this command.",
-        )
+        bot.reply_to(message, "⛔ You are not authorized.")
         return False
-
     return True
 
 
@@ -59,7 +49,6 @@ def admin_only_callback(call):
             show_alert=True,
         )
         return False
-
     return True
 
 
@@ -96,7 +85,7 @@ def admin_keyboard():
         types.InlineKeyboardButton(
             "♻️ Restore Backup",
             callback_data="admin_restore_backup",
-        ),
+        )
     )
 
     return keyboard
@@ -104,24 +93,33 @@ def admin_keyboard():
 
 def back_keyboard():
     keyboard = types.InlineKeyboardMarkup()
-
     keyboard.add(
         types.InlineKeyboardButton(
             "⬅️ Admin Panel",
             callback_data="admin_home",
         )
     )
-
     return keyboard
 
 
-def restore_confirmation_keyboard(index):
+def cancel_restore_keyboard():
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "❌ Cancel Restore",
+            callback_data="admin_restore_cancel",
+        )
+    )
+    return keyboard
+
+
+def confirm_restore_keyboard():
     keyboard = types.InlineKeyboardMarkup(row_width=2)
 
     keyboard.add(
         types.InlineKeyboardButton(
             "✅ Confirm Restore",
-            callback_data=f"admin_restore_confirm_{index}",
+            callback_data="admin_upload_restore_confirm",
         ),
         types.InlineKeyboardButton(
             "❌ Cancel",
@@ -153,15 +151,10 @@ def send_admin_panel(chat_id, message_id=None):
                 parse_mode="HTML",
             )
             return
-
         except Exception as error:
             if "message is not modified" in str(error).lower():
                 return
-
-            logger.debug(
-                "Could not edit admin panel: %s",
-                error,
-            )
+            logger.debug("Admin panel edit failed: %s", error)
 
     bot.send_message(
         chat_id,
@@ -176,7 +169,7 @@ def send_admin_panel(chat_id, message_id=None):
 # =========================================================
 
 def get_available_backups():
-    available = []
+    backups = []
 
     try:
         for item in list_backups():
@@ -189,22 +182,42 @@ def get_available_backups():
             else:
                 path = item
 
-            if not path:
-                continue
-
-            path = os.path.abspath(str(path))
-
-            if os.path.isfile(path):
-                available.append(path)
+            if path:
+                path = os.path.abspath(str(path))
+                if os.path.isfile(path):
+                    backups.append(path)
 
     except Exception:
-        logger.exception("Could not retrieve backup list.")
+        logger.exception("Could not list backups.")
 
-    return available[:20]
+    return backups[:20]
+
+
+def cleanup_pending_restore(user_id):
+    state = pending_restore.pop(user_id, {})
+    path = state.get("uploaded_backup")
+
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            logger.exception("Could not delete temporary backup.")
+
+
+def is_backup_document(message):
+    if not message.document or not message.from_user:
+        return False
+
+    if not is_admin(message.from_user.id):
+        return False
+
+    state = pending_restore.get(message.from_user.id, {})
+
+    return state.get("awaiting_upload") is True
 
 
 # =========================================================
-# REGISTER ADMIN HANDLERS
+# REGISTER HANDLERS
 # =========================================================
 
 def register_admin_handlers():
@@ -254,15 +267,22 @@ def register_admin_handlers():
         try:
             stats = get_global_stats()
 
+            total_users = stats.get("total_users", 0)
+            referrals = stats.get(
+                "lifetime_referrals",
+                stats.get("total_referrals", 0),
+            )
+            coins = stats.get(
+                "lifetime_coins",
+                stats.get("total_coins", 0),
+            )
+
             text = (
                 "📊 <b>ADMIN STATISTICS</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"👥 <b>Total Users:</b> "
-                f"{stats.get('total_users', 0):,}\n"
-                f"🔗 <b>Lifetime Referrals:</b> "
-                f"{stats.get('lifetime_referrals', stats.get('total_referrals', 0)):,}\n"
-                f"🪙 <b>Lifetime Coins:</b> "
-                f"{stats.get('lifetime_coins', stats.get('total_coins', 0)):,}\n\n"
+                f"👥 <b>Total Users:</b> {total_users:,}\n"
+                f"🔗 <b>Lifetime Referrals:</b> {referrals:,}\n"
+                f"🪙 <b>Lifetime Coins:</b> {coins:,}\n\n"
                 f"📅 <b>Today's Referrals:</b> "
                 f"{stats.get('today_referrals', 0):,}\n"
                 f"💰 <b>Today's Coins:</b> "
@@ -278,15 +298,14 @@ def register_admin_handlers():
             )
 
         except Exception:
-            logger.exception("Could not load admin statistics.")
-
+            logger.exception("Admin statistics failed.")
             bot.send_message(
                 call.message.chat.id,
-                "❌ Unable to load statistics. Check server logs.",
+                "❌ Could not load statistics.",
             )
 
     # -----------------------------------------------------
-    # BROADCAST START
+    # BROADCAST
     # -----------------------------------------------------
 
     @bot.callback_query_handler(
@@ -305,8 +324,7 @@ def register_admin_handlers():
         bot.send_message(
             call.message.chat.id,
             "📢 <b>BROADCAST MESSAGE</b>\n\n"
-            "Send the message you want to broadcast.\n"
-            "Text, photos, videos and documents are supported.\n\n"
+            "Send your message, photo, video or document.\n\n"
             "Send /cancel to cancel.",
             parse_mode="HTML",
         )
@@ -328,36 +346,31 @@ def register_admin_handlers():
         )
 
         try:
-            backup_path = create_backup()
+            path = create_backup()
 
-            if not backup_path or not os.path.isfile(backup_path):
-                raise FileNotFoundError(
-                    "Backup file was not created."
-                )
+            if not path or not os.path.isfile(path):
+                raise FileNotFoundError("Backup file not created.")
 
-            size_mb = os.path.getsize(backup_path) / (
-                1024 * 1024
-            )
+            size_mb = os.path.getsize(path) / (1024 * 1024)
 
-            with open(backup_path, "rb") as backup_file:
+            with open(path, "rb") as backup_file:
                 bot.send_document(
                     call.message.chat.id,
                     backup_file,
                     caption=(
-                        "💾 <b>DATABASE BACKUP CREATED</b>\n\n"
-                        f"📁 <code>{escape(os.path.basename(backup_path))}</code>\n"
+                        "💾 <b>BACKUP CREATED</b>\n\n"
+                        f"📁 <code>{escape(os.path.basename(path))}</code>\n"
                         f"📦 Size: {size_mb:.2f} MB\n\n"
-                        "Save this file outside your hosting as well."
+                        "Save this file on your phone too."
                     ),
                     parse_mode="HTML",
                 )
 
         except Exception:
-            logger.exception("Backup creation failed.")
-
+            logger.exception("Create backup failed.")
             bot.send_message(
                 call.message.chat.id,
-                "❌ Backup creation failed. Check server logs.",
+                "❌ Backup creation failed. Check hosting logs.",
             )
 
     # -----------------------------------------------------
@@ -373,53 +386,43 @@ def register_admin_handlers():
 
         bot.answer_callback_query(call.id)
 
-        try:
-            backups = get_available_backups()
+        backups = get_available_backups()
 
-            if not backups:
-                bot.send_message(
-                    call.message.chat.id,
-                    "📁 <b>NO BACKUPS AVAILABLE</b>\n\n"
-                    "Press Create Backup to create your first backup.",
-                    reply_markup=back_keyboard(),
-                    parse_mode="HTML",
-                )
-                return
-
-            lines = [
-                "📁 <b>AVAILABLE DATABASE BACKUPS</b>",
-                "━━━━━━━━━━━━━━━━━━━━",
-                f"Total backups: <b>{len(backups)}</b>",
-            ]
-
-            for index, path in enumerate(backups, start=1):
-                size_mb = os.path.getsize(path) / (
-                    1024 * 1024
-                )
-
-                lines.append(
-                    f"\n<b>{index}.</b> "
-                    f"<code>{escape(os.path.basename(path))}</code>\n"
-                    f"📦 Size: {size_mb:.2f} MB"
-                )
-
+        if not backups:
             bot.send_message(
                 call.message.chat.id,
-                "\n".join(lines),
+                "📁 <b>NO BACKUPS AVAILABLE</b>\n\n"
+                "Create a backup first. If hosting was deleted, "
+                "upload your saved backup using Restore Backup.",
                 reply_markup=back_keyboard(),
                 parse_mode="HTML",
             )
+            return
 
-        except Exception:
-            logger.exception("Could not list backups.")
+        lines = [
+            "📁 <b>AVAILABLE BACKUPS</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"Total: <b>{len(backups)}</b>",
+        ]
 
-            bot.send_message(
-                call.message.chat.id,
-                "❌ Could not list backups. Check server logs.",
+        for index, path in enumerate(backups, start=1):
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+
+            lines.append(
+                f"\n<b>{index}.</b> "
+                f"<code>{escape(os.path.basename(path))}</code>\n"
+                f"📦 Size: {size_mb:.2f} MB"
             )
 
+        bot.send_message(
+            call.message.chat.id,
+            "\n".join(lines),
+            reply_markup=back_keyboard(),
+            parse_mode="HTML",
+        )
+
     # -----------------------------------------------------
-    # RESTORE BACKUP MENU
+    # RESTORE BACKUP: ASK FOR FILE
     # -----------------------------------------------------
 
     @bot.callback_query_handler(
@@ -431,188 +434,196 @@ def register_admin_handlers():
 
         bot.answer_callback_query(call.id)
 
-        try:
-            backups = get_available_backups()
+        # Remove any previous pending upload for this admin.
+        cleanup_pending_restore(call.from_user.id)
 
-            if not backups:
-                bot.send_message(
-                    call.message.chat.id,
-                    "❌ <b>NO BACKUPS AVAILABLE</b>\n\n"
-                    "Create a backup first.",
-                    reply_markup=back_keyboard(),
+        pending_restore[call.from_user.id] = {
+            "awaiting_upload": True,
+        }
+
+        bot.send_message(
+            call.message.chat.id,
+            "♻️ <b>RESTORE DATABASE BACKUP</b>\n\n"
+            "📤 Ab apni saved database backup file bhejo.\n\n"
+            "Supported files: <code>.db</code>, "
+            "<code>.sqlite</code>, <code>.sqlite3</code>\n\n"
+            "File validate hone ke baad confirmation button milega.\n"
+            "Cancel karne ke liye neeche button dabao.",
+            reply_markup=cancel_restore_keyboard(),
+            parse_mode="HTML",
+        )
+
+    # -----------------------------------------------------
+    # RECEIVE UPLOADED BACKUP FILE
+    # -----------------------------------------------------
+
+    @bot.message_handler(
+        content_types=["document"],
+        func=is_backup_document,
+    )
+    def receive_restore_backup(message):
+        user_id = message.from_user.id
+        document = message.document
+
+        filename = document.file_name or "database_backup.db"
+        extension = os.path.splitext(filename)[1].lower()
+
+        if extension not in (".db", ".sqlite", ".sqlite3"):
+            bot.reply_to(
+                message,
+                "❌ Invalid file type. Send a .db, .sqlite "
+                "or .sqlite3 backup file.",
+            )
+            return
+
+        if document.file_size and document.file_size > 50 * 1024 * 1024:
+            bot.reply_to(
+                message,
+                "❌ File too large. Maximum supported size is 50 MB.",
+            )
+            return
+
+        status = bot.reply_to(
+            message,
+            "⏳ Downloading and validating your backup...",
+        )
+
+        temporary_path = None
+
+        try:
+            file_info = bot.get_file(document.file_id)
+            file_data = bot.download_file(file_info.file_path)
+
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+
+            descriptor, temporary_path = tempfile.mkstemp(
+                prefix="database_backup_upload_",
+                suffix=extension,
+                dir=BACKUP_DIR,
+            )
+
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(file_data)
+
+            if not validate_backup(temporary_path):
+                bot.edit_message_text(
+                    "❌ <b>INVALID BACKUP</b>\n\n"
+                    "This file is corrupted or is not a compatible "
+                    "database backup. Your current database was not changed.",
+                    chat_id=status.chat.id,
+                    message_id=status.message_id,
                     parse_mode="HTML",
                 )
                 return
 
-            keyboard = types.InlineKeyboardMarkup(row_width=1)
-            backup_map = {}
-
-            for index, path in enumerate(backups):
-                key = str(index)
-                backup_map[key] = path
-
-                keyboard.add(
-                    types.InlineKeyboardButton(
-                        f"📁 {os.path.basename(path)[:50]}",
-                        callback_data=f"admin_restore_select_{index}",
-                    )
-                )
-
-            keyboard.add(
-                types.InlineKeyboardButton(
-                    "⬅️ Admin Panel",
-                    callback_data="admin_home",
-                )
-            )
-
-            pending_restore[call.from_user.id] = {
-                "backup_map": backup_map,
+            pending_restore[user_id] = {
+                "uploaded_backup": temporary_path,
+                "awaiting_upload": False,
+                "filename": filename,
             }
 
-            bot.send_message(
-                call.message.chat.id,
-                "♻️ <b>RESTORE DATABASE</b>\n\n"
-                "Select the backup you want to restore.\n\n"
-                "⚠️ The selected backup will replace the current database.\n"
-                "A safety backup will be created first.\n\n"
-                "<b>Stop the bot before restoring.</b>",
-                reply_markup=keyboard,
+            # The temporary file must remain available until
+            # confirmation or cancellation.
+            temporary_path = None
+
+            bot.edit_message_text(
+                "✅ <b>BACKUP VALIDATED</b>\n\n"
+                f"📁 File: <code>{escape(filename)}</code>\n\n"
+                "Confirm only if this is the correct backup.\n"
+                "Your current database will be replaced.",
+                chat_id=status.chat.id,
+                message_id=status.message_id,
+                reply_markup=confirm_restore_keyboard(),
                 parse_mode="HTML",
             )
 
         except Exception:
-            logger.exception("Could not prepare restore menu.")
+            logger.exception("Could not process uploaded backup.")
 
-            bot.send_message(
-                call.message.chat.id,
-                "❌ Could not prepare restore menu. Check server logs.",
-            )
+            try:
+                bot.edit_message_text(
+                    "❌ Could not process the backup file. "
+                    "Check hosting logs.",
+                    chat_id=status.chat.id,
+                    message_id=status.message_id,
+                )
+            except Exception:
+                pass
 
-    # -----------------------------------------------------
-    # SELECT BACKUP
-    # -----------------------------------------------------
-
-    @bot.callback_query_handler(
-        func=lambda call: call.data.startswith("admin_restore_select_")
-    )
-    def admin_restore_select_callback(call):
-        if not admin_only_callback(call):
-            return
-
-        try:
-            index = int(call.data.rsplit("_", 1)[1])
-        except (ValueError, IndexError):
-            bot.answer_callback_query(
-                call.id,
-                "Invalid selection.",
-                show_alert=True,
-            )
-            return
-
-        state = pending_restore.get(call.from_user.id, {})
-        backup_path = state.get("backup_map", {}).get(str(index))
-
-        if not backup_path or not os.path.isfile(backup_path):
-            bot.answer_callback_query(
-                call.id,
-                "Backup not found. Open the restore menu again.",
-                show_alert=True,
-            )
-            return
-
-        if not validate_backup(backup_path):
-            bot.answer_callback_query(
-                call.id,
-                "Backup is invalid or corrupted.",
-                show_alert=True,
-            )
-            return
-
-        bot.answer_callback_query(call.id)
-
-        bot.send_message(
-            call.message.chat.id,
-            "⚠️ <b>CONFIRM RESTORE</b>\n\n"
-            f"📁 <code>{escape(os.path.basename(backup_path))}</code>\n\n"
-            "The current database will be replaced.\n"
-            "A safety backup will be created first.\n\n"
-            "Confirm only if you selected the correct file.",
-            reply_markup=restore_confirmation_keyboard(index),
-            parse_mode="HTML",
-        )
+        finally:
+            if temporary_path and os.path.isfile(temporary_path):
+                try:
+                    os.remove(temporary_path)
+                except OSError:
+                    logger.exception("Could not remove temporary file.")
 
     # -----------------------------------------------------
     # CONFIRM RESTORE
     # -----------------------------------------------------
 
     @bot.callback_query_handler(
-        func=lambda call: call.data.startswith("admin_restore_confirm_")
+        func=lambda call: call.data == "admin_upload_restore_confirm"
     )
-    def admin_restore_confirm_callback(call):
+    def confirm_uploaded_restore(call):
         if not admin_only_callback(call):
             return
 
-        try:
-            index = int(call.data.rsplit("_", 1)[1])
-        except (ValueError, IndexError):
-            bot.answer_callback_query(
-                call.id,
-                "Invalid selection.",
-                show_alert=True,
-            )
-            return
-
         state = pending_restore.get(call.from_user.id, {})
-        backup_path = state.get("backup_map", {}).get(str(index))
+        path = state.get("uploaded_backup")
 
-        if not backup_path or not os.path.isfile(backup_path):
+        if not path or not os.path.isfile(path):
             bot.answer_callback_query(
                 call.id,
-                "Backup not found.",
+                "Backup file not found. Upload it again.",
                 show_alert=True,
             )
+            cleanup_pending_restore(call.from_user.id)
             return
 
         try:
-            if not validate_backup(backup_path):
+            if not validate_backup(path):
                 bot.answer_callback_query(
                     call.id,
                     "Backup validation failed.",
                     show_alert=True,
                 )
+                cleanup_pending_restore(call.from_user.id)
                 return
 
             bot.answer_callback_query(
                 call.id,
-                "Restore started.",
+                "Restoring database...",
             )
 
-            result = restore_backup(backup_path)
+            result = restore_backup(path)
 
             if result is not True:
                 raise RuntimeError("Restore did not confirm success.")
 
-            pending_restore.pop(call.from_user.id, None)
+            cleanup_pending_restore(call.from_user.id)
 
             bot.send_message(
                 call.message.chat.id,
-                "✅ <b>RESTORE COMPLETED</b>\n\n"
-                "The database was restored successfully.\n"
-                "Restart the bot to reload the restored database.",
+                "✅ <b>DATABASE RESTORED SUCCESSFULLY</b>\n\n"
+                "The backup has been restored.\n"
+                "Restart the bot so it reloads the restored database.",
                 reply_markup=back_keyboard(),
                 parse_mode="HTML",
             )
 
         except Exception:
-            logger.exception("Database restore failed.")
+            logger.exception("Uploaded database restore failed.")
 
             bot.send_message(
                 call.message.chat.id,
                 "❌ <b>RESTORE FAILED</b>\n\n"
-                "Check server logs and your safety backup.",
+                "Check hosting logs. Your backup file has not "
+                "been intentionally deleted from your phone.",
                 reply_markup=back_keyboard(),
                 parse_mode="HTML",
             )
+
+            cleanup_pending_restore(call.from_user.id)
 
     # -----------------------------------------------------
     # CANCEL RESTORE
@@ -621,11 +632,11 @@ def register_admin_handlers():
     @bot.callback_query_handler(
         func=lambda call: call.data == "admin_restore_cancel"
     )
-    def admin_restore_cancel_callback(call):
+    def cancel_restore_callback(call):
         if not admin_only_callback(call):
             return
 
-        pending_restore.pop(call.from_user.id, None)
+        cleanup_pending_restore(call.from_user.id)
 
         bot.answer_callback_query(
             call.id,
@@ -634,12 +645,12 @@ def register_admin_handlers():
 
         bot.send_message(
             call.message.chat.id,
-            "Restore cancelled. Your database was not changed.",
+            "❌ Restore cancelled. Current database was not changed.",
             reply_markup=back_keyboard(),
         )
 
     # -----------------------------------------------------
-    # ADMIN INPUT HANDLER
+    # ADMIN INPUT: BROADCAST
     # -----------------------------------------------------
 
     @bot.message_handler(
@@ -660,8 +671,8 @@ def register_admin_handlers():
         ],
     )
     def admin_input_handler(message):
-        admin_id = message.from_user.id
-        state = admin_states.get(admin_id)
+        user_id = message.from_user.id
+        state = admin_states.get(user_id)
 
         if not state:
             return
@@ -671,7 +682,7 @@ def register_admin_handlers():
             and message.text
             and message.text.strip().lower() == "/cancel"
         ):
-            admin_states.pop(admin_id, None)
+            admin_states.pop(user_id, None)
 
             bot.reply_to(
                 message,
@@ -679,65 +690,54 @@ def register_admin_handlers():
             )
             return
 
-        action = state.get("action")
-
-        # -------------------------------------------------
-        # BROADCAST
-        # -------------------------------------------------
-
-        if action == "broadcast":
-            try:
-                user_ids = get_all_user_ids()
-
-                admin_states.pop(admin_id, None)
-
-                if not user_ids:
-                    bot.reply_to(
-                        message,
-                        "No users are available.",
-                    )
-                    return
-
-                status = bot.reply_to(
-                    message,
-                    "📢 Broadcast started...",
-                )
-
-                sent = 0
-                failed = 0
-
-                for user_id in user_ids:
-                    try:
-                        bot.copy_message(
-                            chat_id=int(user_id),
-                            from_chat_id=message.chat.id,
-                            message_id=message.message_id,
-                        )
-                        sent += 1
-
-                    except Exception:
-                        failed += 1
-
-                    time.sleep(0.05)
-
-                bot.edit_message_text(
-                    "📢 <b>BROADCAST COMPLETED</b>\n\n"
-                    f"✅ Sent: <b>{sent}</b>\n"
-                    f"❌ Failed: <b>{failed}</b>",
-                    chat_id=status.chat.id,
-                    message_id=status.message_id,
-                    parse_mode="HTML",
-                    reply_markup=back_keyboard(),
-                )
-
-            except Exception:
-                logger.exception("Broadcast failed.")
-
-                admin_states.pop(admin_id, None)
-
-                bot.reply_to(
-                    message,
-                    "❌ Broadcast failed. Check server logs.",
-                )
-
+        if state.get("action") != "broadcast":
             return
+
+        try:
+            user_ids = get_all_user_ids()
+            admin_states.pop(user_id, None)
+
+            if not user_ids:
+                bot.reply_to(message, "No users are available.")
+                return
+
+            status = bot.reply_to(
+                message,
+                "📢 Broadcast started...",
+            )
+
+            sent = 0
+            failed = 0
+
+            for target_id in user_ids:
+                try:
+                    bot.copy_message(
+                        chat_id=int(target_id),
+                        from_chat_id=message.chat.id,
+                        message_id=message.message_id,
+                    )
+                    sent += 1
+
+                except Exception:
+                    failed += 1
+
+                time.sleep(0.05)
+
+            bot.edit_message_text(
+                "📢 <b>BROADCAST COMPLETED</b>\n\n"
+                f"✅ Sent: <b>{sent}</b>\n"
+                f"❌ Failed: <b>{failed}</b>",
+                chat_id=status.chat.id,
+                message_id=status.message_id,
+                parse_mode="HTML",
+                reply_markup=back_keyboard(),
+            )
+
+        except Exception:
+            logger.exception("Broadcast failed.")
+            admin_states.pop(user_id, None)
+
+            bot.reply_to(
+                message,
+                "❌ Broadcast failed. Check hosting logs.",
+            )
