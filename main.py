@@ -13,6 +13,8 @@ from leaderboard import register_leaderboard_handlers
 from info import register_info_handlers
 from admin import register_admin_handlers
 from recovery import register_recovery_handlers
+
+from daily_competition import init_competition_tables
 from scheduler import start_scheduler, stop_scheduler
 
 
@@ -38,7 +40,23 @@ def create_directories():
 
 
 # =========================================================
-# HANDLERS
+# DATABASE INITIALIZATION
+# =========================================================
+
+def initialize_database():
+    logger.info("Initializing main database...")
+
+    init_db()
+
+    logger.info("Initializing daily competition tables...")
+
+    init_competition_tables()
+
+    logger.info("Database initialization completed.")
+
+
+# =========================================================
+# HANDLER REGISTRATION
 # =========================================================
 
 def register_handlers():
@@ -53,7 +71,7 @@ def register_handlers():
     register_admin_handlers()
     register_recovery_handlers()
 
-    logger.info("All handlers registered successfully.")
+    logger.info("All Telegram handlers registered successfully.")
 
 
 # =========================================================
@@ -61,35 +79,29 @@ def register_handlers():
 # =========================================================
 
 def main():
-    create_directories()
-
-    logger.info("Initializing database...")
+    scheduler_started = False
 
     try:
-        init_db()
-    except Exception:
-        logger.exception("Database initialization failed.")
-        raise
+        # STEP 1: Create required directories.
+        create_directories()
 
-    logger.info("Registering handlers...")
+        # STEP 2: Initialize database tables.
+        initialize_database()
 
-    try:
+        # STEP 3: Register all handlers.
         register_handlers()
-    except Exception:
-        logger.exception("Handler registration failed.")
-        raise
 
-    logger.info("Starting daily scheduler...")
+        # STEP 4: Start daily backup and competition scheduler.
+        logger.info("Starting daily scheduler...")
 
-    try:
         start_scheduler()
-    except Exception:
-        logger.exception("Scheduler startup failed.")
-        raise
+        scheduler_started = True
 
-    logger.info("Starting Telegram bot...")
+        logger.info("Daily scheduler started successfully.")
 
-    try:
+        # STEP 5: Start Telegram polling.
+        logger.info("Starting Telegram bot polling...")
+
         while True:
             try:
                 bot.infinity_polling(
@@ -102,31 +114,44 @@ def main():
                     ],
                 )
 
-                # If polling exits normally, wait before retrying.
+                # Polling should normally keep running.
                 logger.warning(
-                    "Polling stopped. Restarting in 5 seconds..."
+                    "Telegram polling stopped. "
+                    "Retrying in 5 seconds..."
                 )
+
                 time.sleep(5)
 
             except KeyboardInterrupt:
-                logger.info("Bot stopped manually.")
+                logger.info("Bot shutdown requested.")
                 break
 
             except Exception:
                 logger.exception(
-                    "Bot polling failed. Retrying in 5 seconds..."
+                    "Telegram polling failed. "
+                    "Retrying in 5 seconds..."
                 )
+
                 time.sleep(5)
 
+    except KeyboardInterrupt:
+        logger.info("Bot stopped manually.")
+
+    except Exception:
+        logger.exception("Bot startup failed.")
+
     finally:
-        logger.info("Shutting down scheduler...")
+        if scheduler_started:
+            logger.info("Stopping daily scheduler...")
 
-        try:
-            stop_scheduler()
-        except Exception:
-            logger.exception("Scheduler shutdown failed.")
+            try:
+                stop_scheduler()
+                logger.info("Scheduler stopped successfully.")
 
-        logger.info("Bot shutdown complete.")
+            except Exception:
+                logger.exception("Scheduler shutdown failed.")
+
+        logger.info("Bot process has stopped.")
 
 
 # =========================================================
