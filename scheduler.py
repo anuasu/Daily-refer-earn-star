@@ -1,5 +1,6 @@
-import logging
 import os
+import html
+import logging
 import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -9,14 +10,21 @@ from apscheduler.triggers.cron import CronTrigger
 
 from config import (
     TIMEZONE,
+    ADMIN_IDS,
     RESULTS_CHANNEL_ID,
     DAILY_WINNERS_COUNT,
     STARS_PER_WINNER,
 )
 
 from bot_instance import bot
+
 from backup import create_backup
-from database import get_connection, reset_daily_coins
+
+from database import (
+    get_connection,
+    reset_daily_coins,
+)
+
 from daily_competition import (
     init_competition_tables,
     get_competition_status,
@@ -24,23 +32,20 @@ from daily_competition import (
     get_winners,
     mark_winners_announced,
     mark_competition_reset,
+    update_competition_status,
 )
 
-
-# =====================================================
-# CONFIGURATION
-# =====================================================
-
 logger = logging.getLogger(__name__)
+
 TZ = ZoneInfo(TIMEZONE)
 
 _scheduler = None
 _run_lock = threading.Lock()
 
 
-# =====================================================
+# =========================================================
 # DATE HELPERS
-# =====================================================
+# =========================================================
 
 def today_date():
     return datetime.now(TZ).date().isoformat()
@@ -52,13 +57,23 @@ def yesterday_date():
     ).isoformat()
 
 
-# =====================================================
-# RUN STATUS HELPERS
-# =====================================================
+def now_string():
+    return datetime.now(TZ).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+# =========================================================
+# DATABASE HELPERS
+# =========================================================
 
 def get_run_row(competition_date):
-    with get_connection() as conn:
-        return conn.execute(
+    init_competition_tables()
+
+    conn = get_connection()
+
+    try:
+        row = conn.execute(
             """
             SELECT *
             FROM competition_runs
@@ -67,178 +82,248 @@ def get_run_row(competition_date):
             (competition_date,),
         ).fetchone()
 
+        return dict(row) if row else None
+
+    finally:
+        conn.close()
+
 
 def ensure_run_exists(competition_date):
-    now = datetime.now(TZ).isoformat(timespec="seconds")
-
-    with get_connection() as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO competition_runs (
-                competition_date,
-                status,
-                started_at
-            )
-            VALUES (?, 'RUNNING', ?)
-            """,
-            (competition_date, now),
-        )
-
-
-def update_run(
-    competition_date,
-    status=None,
-    backup_path=None,
-    announcement_sent=None,
-    completed=False,
-):
-    assignments = []
-    values = []
-
-    if status is not None:
-        assignments.append("status = ?")
-        values.append(status)
-
-    if backup_path is not None:
-        assignments.append("backup_path = ?")
-        values.append(backup_path)
-
-    if announcement_sent is not None:
-        assignments.append("announcement_sent = ?")
-        values.append(int(announcement_sent))
-
-    if completed:
-        assignments.append("completed_at = ?")
-        values.append(
-            datetime.now(TZ).isoformat(timespec="seconds")
-        )
-
-    if not assignments:
+    if get_run_row(competition_date):
         return
 
-    values.append(competition_date)
+    update_competition_status(
+        competition_date=competition_date,
+        status="RUNNING",
+    )
 
-    with get_connection() as conn:
-        conn.execute(
-            f"""
-            UPDATE competition_runs
-            SET {", ".join(assignments)}
-            WHERE competition_date = ?
-            """,
-            values,
+
+def is_completed(competition_date):
+    row = get_run_row(competition_date)
+
+    if not row:
+        return False
+
+    return str(
+        row.get("status", "")
+    ).upper() == "COMPLETED"
+
+
+# =========================================================
+# ADMIN NOTIFICATIONS
+# =========================================================
+
+def notify_admins(message):
+    for admin_id in ADMIN_IDS:
+        try:
+            bot.send_message(
+                admin_id,
+                message,
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.exception(
+                "Could not notify admin %s",
+                admin_id,
+            )
+
+
+# =========================================================
+# MIDNIGHT DATABASE BACKUP
+# =========================================================
+
+def midnight_backup():
+    """
+    Creates a database backup and informs admins.
+    This function does not reset user balances.
+    """
+
+    try:
+        backup_path = create_backup()
+
+        if not backup_path:
+            raise RuntimeError(
+                "Backup function returned no backup path."
+            )
+
+        message = (
+            "💾 <b>DAILY DATABASE BACKUP</b>\n\n"
+            f"📅 Date: <code>{today_date()}</code>\n"
+            "✅ Backup created successfully.\n"
+            f"📁 File: <code>{html.escape(os.path.basename(str(backup_path)))}</code>"
+        )
+
+        notify_admins(message)
+
+        logger.info(
+            "Midnight backup completed: %s",
+            backup_path,
+        )
+
+    except Exception as exc:
+        logger.exception("Midnight backup failed")
+
+        notify_admins(
+            "⚠️ <b>DATABASE BACKUP FAILED</b>\n\n"
+            f"📅 Date: <code>{today_date()}</code>\n"
+            f"❌ Error: <code>{html.escape(str(exc)[:700])}</code>"
         )
 
 
-# =====================================================
-# WINNER ANNOUNCEMENT
-# =====================================================
+# =========================================================
+# RESULTS MESSAGE
+# =========================================================
 
 def build_winner_message(competition_date, winners):
     lines = [
-        "🏆 <b>DAILY REFERRAL COMPETITION RESULTS</b>",
+        "🏆 <b>SF DAILY GIFTS — DAILY RESULTS</b>",
         "",
-        f"📅 Date: <b>{competition_date}</b>",
+        f"📅 Date: <code>{competition_date}</code>",
+        f"🎖️ Top {DAILY_WINNERS_COUNT} Winners",
+        f"⭐ Prize: <b>{STARS_PER_WINNER} Stars each</b>",
         "",
     ]
 
     if not winners:
         lines.extend([
-            "No eligible participants were recorded for this competition.",
+            "No participants were recorded for this day.",
             "",
-            "Thank you for being part of SF DAILY GIFTS!",
         ])
-        return "\n".join(lines)
 
-    lines.append("<b>TOP WINNERS</b>")
-
-    for winner in winners[:DAILY_WINNERS_COUNT]:
-        rank = winner["rank"]
-        name = winner["first_name"] or "Telegram User"
-        username = winner["username"]
-        coins = winner["coins"]
-        referrals = winner["referrals"]
-
-        if username:
-            display = f"{name} (@{username})"
-        else:
-            display = name
-
-        # Escape HTML special characters in Telegram names.
-        from html import escape
-
-        display = escape(display)
-
-        lines.append(
-            f"\n<b>#{rank}</b> {display}\n"
-            f"   🪙 Coins: <b>{coins}</b>\n"
-            f"   👥 Referrals: <b>{referrals}</b>\n"
-            f"   ⭐ Prize: <b>{STARS_PER_WINNER} Stars</b>"
+    for winner in winners:
+        rank = winner.get("rank", "-")
+        user_id = winner.get("user_id", "-")
+        first_name = winner.get("first_name") or "Unknown"
+        username = winner.get("username")
+        coins = winner.get("coins", winner.get("daily_coins", 0))
+        referrals = winner.get(
+            "referrals",
+            winner.get("daily_referrals", 0),
         )
 
+        safe_name = html.escape(str(first_name))
+
+        if username:
+            safe_username = html.escape(
+                str(username).lstrip("@")
+            )
+            username_text = f"@{safe_username}"
+        else:
+            username_text = "Not set"
+
+        lines.extend([
+            f"<b>#{rank} — {safe_name}</b>",
+            f"👤 Username: {username_text}",
+            f"🆔 Chat ID: <code>{user_id}</code>",
+            f"🪙 Daily Coins: <b>{coins}</b>",
+            f"👥 Daily Referrals: <b>{referrals}</b>",
+            f"⭐ Reward: <b>{STARS_PER_WINNER} Stars</b>",
+            "",
+        ])
+
     lines.extend([
-        "",
-        "Congratulations to all winners!",
-        "Thank you for participating.",
+        "💖 Thanks for participating!",
+        "⚠️ Star rewards are subject to the actual reward-delivery process.",
     ])
 
     return "\n".join(lines)
 
 
-def publish_winners(competition_date):
-    row = get_run_row(competition_date)
+# =========================================================
+# PUBLISH RESULTS
+# =========================================================
 
-    if row and row["announcement_sent"]:
+def publish_winners(competition_date):
+    row = get_run_row(competition_date) or {}
+
+    if row.get("announcement_sent"):
         logger.info(
-            "Announcement already recorded for %s",
+            "Results already announced for %s",
             competition_date,
         )
         return True
 
     winners = get_winners(competition_date)
-    text = build_winner_message(competition_date, winners)
 
-    message = bot.send_message(
+    message = build_winner_message(
+        competition_date,
+        winners,
+    )
+
+    sent_message = bot.send_message(
         RESULTS_CHANNEL_ID,
-        text,
+        message,
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
 
-    # Record publication only after Telegram confirms success.
     mark_winners_announced(
         competition_date,
-        message.message_id,
-    )
-
-    update_run(
-        competition_date,
-        status="ANNOUNCED",
-        announcement_sent=True,
+        sent_message.message_id,
     )
 
     logger.info(
-        "Results announced for %s; message_id=%s",
+        "Results published for %s",
         competition_date,
-        message.message_id,
     )
 
     return True
 
 
-# =====================================================
-# SAFE COMPETITION PROCESSING
-# =====================================================
+# =========================================================
+# RESET ONLY WINNERS' DAILY COINS
+# =========================================================
+
+def reset_winners_daily_coins(competition_date):
+    """
+    Only Top 10 winner balances are reset.
+    Lifetime coins and all referral counts remain unchanged.
+    """
+
+    winners = get_winners(competition_date)
+
+    winner_ids = [
+        int(winner["user_id"])
+        for winner in winners
+        if winner.get("user_id") is not None
+    ]
+
+    if not winner_ids:
+        logger.info(
+            "No winners to reset for %s",
+            competition_date,
+        )
+        return
+
+    # reset_daily_coins must accept winner_ids and reset ONLY
+    # users.daily_coins for these IDs. It must not clear referrals.
+    reset_daily_coins(winner_ids=winner_ids)
+
+    logger.info(
+        "Reset daily coins for %s winners: %s",
+        len(winner_ids),
+        winner_ids,
+    )
+
+
+# =========================================================
+# RUN DAILY COMPETITION
+# =========================================================
 
 def run_daily_competition():
     """
-    Process yesterday's competition.
-
-    Stages are saved in SQLite so a restart does not
-    automatically reset today's counters again.
+    Daily sequence:
+    1. Backup database.
+    2. Finalize previous day's Top 10.
+    3. Publish results.
+    4. Reset only winner daily coins.
+    5. Mark competition completed.
     """
 
     if not _run_lock.acquire(blocking=False):
-        logger.warning("Competition task is already running.")
+        logger.warning(
+            "Competition is already running."
+        )
         return
 
     competition_date = yesterday_date()
@@ -247,169 +332,198 @@ def run_daily_competition():
         init_competition_tables()
         ensure_run_exists(competition_date)
 
-        row = get_run_row(competition_date)
-
-        if not row:
-            raise RuntimeError("Could not create competition record.")
-
-        status = row["status"]
-
-        # Already completed: do not repeat any stage.
-        if status == "COMPLETED":
+        if is_completed(competition_date):
             logger.info(
-                "Competition %s is already completed.",
+                "Competition already completed for %s",
                 competition_date,
             )
             return
 
-        # Stage 1: create and record a backup.
-        if not row["backup_path"]:
+        # STEP 1: BACKUP
+        run = get_run_row(competition_date) or {}
+
+        if not run.get("backup_path"):
             backup_path = create_backup()
 
-            update_run(
-                competition_date,
-                backup_path=backup_path,
+            if not backup_path:
+                raise RuntimeError(
+                    "Competition backup failed."
+                )
+
+            update_competition_status(
+                competition_date=competition_date,
                 status="BACKED_UP",
+                backup_path=str(backup_path),
             )
 
-            logger.info("Backup created: %s", backup_path)
+            notify_admins(
+                "💾 <b>COMPETITION BACKUP COMPLETE</b>\n\n"
+                f"📅 Competition date: <code>{competition_date}</code>\n"
+                f"📁 File: <code>{html.escape(os.path.basename(str(backup_path)))}</code>"
+            )
 
-        # Stage 2: finalize and save winners.
-        row = get_run_row(competition_date)
+        # STEP 2: FINALIZE WINNERS
+        run = get_run_row(competition_date) or {}
+        status = str(run.get("status", "")).upper()
 
-        if row["status"] in ("RUNNING", "BACKED_UP"):
+        if status not in (
+            "FINALIZED",
+            "ANNOUNCED",
+            "COMPLETED",
+        ):
             finalize_competition(competition_date)
 
-            update_run(
-                competition_date,
+            update_competition_status(
+                competition_date=competition_date,
                 status="FINALIZED",
             )
 
-            logger.info(
-                "Competition finalized: %s",
-                competition_date,
-            )
+        # STEP 3: PUBLISH RESULTS
+        run = get_run_row(competition_date) or {}
 
-        # Stage 3: publish results.
-        row = get_run_row(competition_date)
-
-        if not row["announcement_sent"]:
+        if not run.get("announcement_sent"):
             publish_winners(competition_date)
 
-        # Stage 4: reset only after backup, finalization,
-        # and successful publication have been recorded.
-        row = get_run_row(competition_date)
+        # STEP 4: RESET ONLY AFTER RESULTS ARE PUBLISHED
+        run = get_run_row(competition_date) or {}
 
-        if not row or not row["announcement_sent"]:
+        if not run.get("announcement_sent"):
             raise RuntimeError(
-                "Results have not been recorded as published; "
-                "daily counters were not reset."
+                "Results are not confirmed as published; "
+                "winner balances will not be reset."
             )
 
-        reset_daily_coins()
+        if not run.get("reset_at"):
+            reset_winners_daily_coins(
+                competition_date
+            )
 
-        mark_competition_reset(competition_date)
+            mark_competition_reset(
+                competition_date
+            )
 
-        update_run(
-            competition_date,
+        update_competition_status(
+            competition_date=competition_date,
             status="COMPLETED",
             completed=True,
         )
 
+        notify_admins(
+            "✅ <b>DAILY COMPETITION COMPLETED</b>\n\n"
+            f"📅 Date: <code>{competition_date}</code>\n"
+            "🏆 Results published.\n"
+            "💰 Only winners' daily coins were reset.\n"
+            "👥 Referral history preserved.\n"
+            "📊 Lifetime statistics preserved."
+        )
+
         logger.info(
-            "Daily competition completed: %s",
+            "Daily competition completed for %s",
             competition_date,
         )
 
-    except Exception:
+    except Exception as exc:
         logger.exception(
-            "Daily competition failed for %s. "
-            "It can be retried after the error is resolved.",
+            "Daily competition failed for %s",
             competition_date,
+        )
+
+        notify_admins(
+            "⚠️ <b>DAILY COMPETITION ERROR</b>\n\n"
+            f"📅 Date: <code>{competition_date}</code>\n"
+            f"❌ Error: <code>{html.escape(str(exc)[:700])}</code>\n\n"
+            "The process will be retried automatically."
         )
 
     finally:
         _run_lock.release()
 
 
-# =====================================================
-# STARTUP RECOVERY
-# =====================================================
+# =========================================================
+# RECOVER INTERRUPTED COMPETITION
+# =========================================================
 
 def recover_pending_competition():
-    """
-    Retry incomplete previous-day processing.
-
-    Completed runs are ignored.
-    """
-
     try:
         competition_date = yesterday_date()
         row = get_run_row(competition_date)
 
-        if row and row["status"] != "COMPLETED":
-            logger.info(
-                "Recovering incomplete competition: %s",
-                competition_date,
-            )
+        if not row or str(
+            row.get("status", "")
+        ).upper() != "COMPLETED":
             run_daily_competition()
 
     except Exception:
-        logger.exception("Competition recovery failed.")
+        logger.exception(
+            "Competition recovery check failed"
+        )
 
 
-# =====================================================
-# SCHEDULER
-# =====================================================
+# =========================================================
+# START SCHEDULER
+# =========================================================
 
 def start_scheduler():
     global _scheduler
 
     if _scheduler and _scheduler.running:
         logger.info("Scheduler is already running.")
-        return
-
-    init_competition_tables()
+        return _scheduler
 
     _scheduler = BackgroundScheduler(
-        timezone=TZ,
-        job_defaults={
-            "coalesce": True,
-            "max_instances": 1,
-            "misfire_grace_time": 3600,
-        },
+        timezone=TZ
     )
 
-    # Main run at midnight IST.
+    # Independent daily backup at midnight India time.
     _scheduler.add_job(
-        run_daily_competition,
+        midnight_backup,
         CronTrigger(
             hour=0,
             minute=0,
             timezone=TZ,
         ),
-        id="daily_competition",
+        id="midnight_database_backup",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
     )
 
-    # Retry incomplete runs. Completed runs are skipped.
+    # Process the previous day's competition after midnight.
+    # A short delay lets the midnight backup run first.
+    _scheduler.add_job(
+        run_daily_competition,
+        CronTrigger(
+            hour=0,
+            minute=5,
+            timezone=TZ,
+        ),
+        id="daily_competition",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+
+    # Recover an interrupted run periodically.
     _scheduler.add_job(
         recover_pending_competition,
         "interval",
         minutes=5,
         id="competition_recovery",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
 
     _scheduler.start()
 
-    logger.info("Daily scheduler started (%s).", TIMEZONE)
+    logger.info(
+        "Scheduler started using timezone %s",
+        TIMEZONE,
+    )
 
-    # Recover an incomplete run after a process restart.
-    threading.Thread(
-        target=recover_pending_competition,
-        daemon=True,
-    ).start()
+    return _scheduler
 
 
 def stop_scheduler():
@@ -417,4 +531,6 @@ def stop_scheduler():
 
     if _scheduler and _scheduler.running:
         _scheduler.shutdown(wait=False)
-        logger.info("Daily scheduler stopped.")
+        logger.info("Scheduler stopped.")
+
+    _scheduler = None
