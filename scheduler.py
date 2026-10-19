@@ -18,8 +18,7 @@ from config import (
 )
 
 from bot_instance import bot
-from backup import create_backup, validate_backup
-
+from backup import create_backup
 from database import get_connection
 
 from daily_competition import (
@@ -29,14 +28,12 @@ from daily_competition import (
     mark_winners_announced,
 )
 
-
 logger = logging.getLogger(__name__)
 
 TZ = ZoneInfo(TIMEZONE)
 
 _scheduler = None
 _run_lock = threading.Lock()
-_backup_lock = threading.Lock()
 
 
 # =========================================================
@@ -74,6 +71,40 @@ def notify_admins(message):
         except Exception:
             logger.exception(
                 "Admin notification failed: %s",
+                admin_id,
+            )
+
+
+def send_backup_to_admins(backup_path, title):
+    """
+    Send the actual backup file to admins.
+    """
+
+    if not backup_path or not os.path.isfile(backup_path):
+        raise FileNotFoundError(
+            f"Backup file not found: {backup_path}"
+        )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            with open(backup_path, "rb") as backup_file:
+                bot.send_document(
+                    admin_id,
+                    backup_file,
+                    caption=(
+                        f"💾 <b>{html.escape(title)}</b>\n\n"
+                        f"📅 Date: <code>{today_date()}</code>\n"
+                        f"📁 File: <code>"
+                        f"{html.escape(os.path.basename(backup_path))}"
+                        f"</code>"
+                    ),
+                    parse_mode="HTML",
+                    timeout=120,
+                )
+
+        except Exception:
+            logger.exception(
+                "Could not send backup to admin %s",
                 admin_id,
             )
 
@@ -179,155 +210,51 @@ def is_completed(competition_date):
 
     return bool(
         row
-        and str(row.get("status", "")).upper()
-        == "COMPLETED"
+        and str(row.get("status", "")).upper() == "COMPLETED"
     )
 
 
 # =========================================================
-# DAILY MIDNIGHT BACKUP
+# MIDNIGHT BACKUP
 # =========================================================
 
 def midnight_backup():
     """
-    Create at most one successful daily backup per date.
-
-    The daily marker is stored in SQLite so a scheduler
-    retry does not create another backup after success.
+    Create a database backup and send the actual file
+    to each admin.
     """
 
-    if not _backup_lock.acquire(blocking=False):
-        logger.warning(
-            "Daily backup is already running."
-        )
-        return
-
-    backup_date = today_date()
-
     try:
-        init_competition_tables()
-
-        conn = get_connection()
-
-        try:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS daily_backup_runs (
-                    backup_date TEXT PRIMARY KEY,
-                    backup_path TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-
-            existing = conn.execute(
-                """
-                SELECT backup_path
-                FROM daily_backup_runs
-                WHERE backup_date = ?
-                """,
-                (backup_date,),
-            ).fetchone()
-
-        finally:
-            conn.close()
-
-        if existing:
-            existing_path = existing["backup_path"]
-
-            if (
-                existing_path
-                and os.path.isfile(existing_path)
-                and validate_backup(existing_path)
-            ):
-                logger.info(
-                    "Daily backup already exists for %s: %s",
-                    backup_date,
-                    existing_path,
-                )
-                return
-
-            logger.warning(
-                "Daily backup marker exists but file is missing/invalid: %s",
-                backup_date,
-            )
-
-        # Create the real SQLite backup.
         backup_path = create_backup()
 
         if not backup_path:
             raise RuntimeError(
-                "Backup function returned no path."
+                "Backup creation returned no file path."
             )
-
-        if not os.path.isfile(backup_path):
-            raise FileNotFoundError(
-                "Backup file was not found after creation."
-            )
-
-        if not validate_backup(backup_path):
-            raise RuntimeError(
-                "Created backup failed validation."
-            )
-
-        # Record success only after the file is validated.
-        conn = get_connection()
-
-        try:
-            conn.execute(
-                """
-                INSERT INTO daily_backup_runs (
-                    backup_date,
-                    backup_path,
-                    created_at
-                )
-                VALUES (?, ?, ?)
-                ON CONFLICT(backup_date)
-                DO UPDATE SET
-                    backup_path = excluded.backup_path,
-                    created_at = excluded.created_at
-                """,
-                (
-                    backup_date,
-                    os.path.abspath(backup_path),
-                    now_string(),
-                ),
-            )
-
-        finally:
-            conn.close()
-
-        filename = html.escape(
-            os.path.basename(backup_path)
-        )
-
-        notify_admins(
-            "💾 <b>DAILY DATABASE BACKUP</b>\n\n"
-            f"📅 Date: <code>{backup_date}</code>\n"
-            "✅ Database backup created successfully.\n"
-            f"📁 File: <code>{filename}</code>"
-        )
 
         logger.info(
-            "Daily backup completed: %s",
+            "Midnight backup created: %s",
             backup_path,
         )
 
-    except Exception as exc:
-        logger.exception(
-            "Daily backup failed for %s",
-            backup_date,
+        send_backup_to_admins(
+            backup_path,
+            "DAILY DATABASE BACKUP",
         )
+
+        logger.info(
+            "Midnight backup delivery finished."
+        )
+
+    except Exception as exc:
+        logger.exception("Midnight backup failed.")
 
         notify_admins(
-            "⚠️ <b>DAILY DATABASE BACKUP FAILED</b>\n\n"
-            f"📅 Date: <code>{backup_date}</code>\n"
+            "⚠️ <b>DATABASE BACKUP ERROR</b>\n\n"
+            f"📅 Date: <code>{today_date()}</code>\n"
             f"❌ Error: <code>"
-            f"{html.escape(str(exc)[:400])}</code>"
+            f"{html.escape(str(exc)[:500])}</code>"
         )
-
-    finally:
-        _backup_lock.release()
 
 
 # =========================================================
@@ -335,78 +262,35 @@ def midnight_backup():
 # =========================================================
 
 def ensure_competition_backup(competition_date):
-    """
-    Reuse the daily backup when possible.
-    Otherwise create one competition backup and record it.
-    """
-
     run = get_run_row(competition_date) or {}
 
-    recorded_path = run.get("backup_path")
+    existing_path = run.get("backup_path")
 
-    if (
-        recorded_path
-        and os.path.isfile(recorded_path)
-        and validate_backup(recorded_path)
-    ):
-        return recorded_path
+    if existing_path and os.path.isfile(existing_path):
+        return existing_path
 
-    # Reuse today's successful midnight backup if available.
-    conn = get_connection()
-
-    try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS daily_backup_runs (
-                backup_date TEXT PRIMARY KEY,
-                backup_path TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-
-        row = conn.execute(
-            """
-            SELECT backup_path
-            FROM daily_backup_runs
-            WHERE backup_date = ?
-            """,
-            (today_date(),),
-        ).fetchone()
-
-    finally:
-        conn.close()
-
-    if row:
-        path = row["backup_path"]
-
-        if (
-            path
-            and os.path.isfile(path)
-            and validate_backup(path)
-        ):
-            update_run_status(
-                competition_date,
-                backup_path=path,
-            )
-            return path
-
-    # Fallback: create a backup only when no usable backup exists.
     backup_path = create_backup()
 
-    if not backup_path or not validate_backup(backup_path):
+    if not backup_path:
         raise RuntimeError(
-            "Competition backup creation failed validation."
+            "Competition backup failed."
         )
 
     update_run_status(
-        competition_date,
+        competition_date=competition_date,
+        status="BACKED_UP",
         backup_path=backup_path,
     )
 
     logger.info(
         "Competition backup created: %s",
         backup_path,
+    )
+
+    # Send the actual backup file.
+    send_backup_to_admins(
+        backup_path,
+        "COMPETITION DATABASE BACKUP",
     )
 
     return backup_path
@@ -436,20 +320,31 @@ def build_winner_message(competition_date, winners):
         rank = winner.get("rank", "-")
         first_name = winner.get("first_name") or "Unknown"
         username = winner.get("username")
-        coins = winner.get("coins", 0)
-        referrals = winner.get("referrals", 0)
+        user_id = winner.get("user_id", "-")
+
+        coins = winner.get(
+            "coins",
+            winner.get("daily_coins", 0),
+        )
+
+        referrals = winner.get(
+            "referrals",
+            winner.get("daily_referrals", 0),
+        )
 
         safe_name = html.escape(str(first_name))
 
         if username:
-            username_text = "@" + html.escape(
-                str(username).lstrip("@")
+            username_text = (
+                "@"
+                + html.escape(str(username).lstrip("@"))
             )
         else:
             username_text = "Not set"
 
         lines.extend([
             f"<b>#{rank} — {safe_name}</b>",
+            f"🆔 User ID: <code>{user_id}</code>",
             f"👤 Username: {username_text}",
             f"🪙 Daily Coins: <b>{coins}</b>",
             f"👥 Daily Referrals: <b>{referrals}</b>",
@@ -473,6 +368,10 @@ def publish_winners(competition_date):
     run = get_run_row(competition_date) or {}
 
     if run.get("announcement_sent"):
+        logger.info(
+            "Results already published for %s",
+            competition_date,
+        )
         return True
 
     winners = get_winners(competition_date)
@@ -489,6 +388,7 @@ def publish_winners(competition_date):
         disable_web_page_preview=True,
     )
 
+    # Record successful delivery immediately.
     mark_winners_announced(
         competition_date,
         sent_message.message_id,
@@ -503,7 +403,7 @@ def publish_winners(competition_date):
 
 
 # =========================================================
-# ATOMIC WINNER RESET
+# ATOMIC WINNER COIN RESET
 # =========================================================
 
 def reset_winners_daily_coins(competition_date):
@@ -538,11 +438,17 @@ def reset_winners_daily_coins(competition_date):
 
         if not run["announcement_sent"]:
             raise RuntimeError(
-                "Results are not confirmed as published."
+                "Results have not been confirmed as published."
             )
 
         if run["reset_at"]:
             conn.commit()
+
+            logger.info(
+                "Winner coins already reset for %s",
+                competition_date,
+            )
+
             return 0
 
         reset_count = 0
@@ -578,7 +484,7 @@ def reset_winners_daily_coins(competition_date):
         conn.commit()
 
         logger.info(
-            "Winner daily coins reset for %s; rows=%s",
+            "Winner coins reset for %s; rows=%s",
             competition_date,
             reset_count,
         )
@@ -594,15 +500,10 @@ def reset_winners_daily_coins(competition_date):
 
 
 # =========================================================
-# DAILY COMPETITION
+# RUN DAILY COMPETITION
 # =========================================================
 
 def run_daily_competition():
-    """
-    Finalize yesterday's competition, publish results,
-    reset winners' daily coins once, then mark completed.
-    """
-
     if not _run_lock.acquire(blocking=False):
         logger.warning(
             "Competition is already running."
@@ -615,18 +516,23 @@ def run_daily_competition():
         init_competition_tables()
         ensure_run_exists(competition_date)
 
-        if is_completed(competition_date):
+        run = get_run_row(competition_date) or {}
+
+        # Check completion before doing anything else.
+        if str(run.get("status", "")).upper() == "COMPLETED":
             logger.info(
                 "Competition already completed: %s",
                 competition_date,
             )
             return
 
+        # STEP 1: BACKUP
         ensure_competition_backup(competition_date)
 
         run = get_run_row(competition_date) or {}
         status = str(run.get("status", "")).upper()
 
+        # STEP 2: FINALIZE WINNERS
         if status not in (
             "FINALIZED",
             "ANNOUNCED",
@@ -639,19 +545,23 @@ def run_daily_competition():
                 status="FINALIZED",
             )
 
+        # STEP 3: PUBLISH RESULTS ONCE
         run = get_run_row(competition_date) or {}
 
         if not run.get("announcement_sent"):
             publish_winners(competition_date)
 
+        # STEP 4: RESET WINNER COINS ONCE
         reset_winners_daily_coins(competition_date)
 
+        # STEP 5: MARK COMPLETED
         update_run_status(
             competition_date,
             status="COMPLETED",
             completed=True,
         )
 
+        # Only reached after the run completes.
         notify_admins(
             "✅ <b>DAILY COMPETITION COMPLETED</b>\n\n"
             f"📅 Date: <code>{competition_date}</code>\n"
@@ -676,8 +586,8 @@ def run_daily_competition():
             "⚠️ <b>DAILY COMPETITION ERROR</b>\n\n"
             f"📅 Date: <code>{competition_date}</code>\n"
             f"❌ Error: <code>"
-            f"{html.escape(str(exc)[:400])}</code>\n\n"
-            "The scheduler will retry automatically."
+            f"{html.escape(str(exc)[:500])}</code>\n\n"
+            "The recovery job will check again later."
         )
 
     finally:
@@ -689,11 +599,19 @@ def run_daily_competition():
 # =========================================================
 
 def recover_pending_competition():
+    """
+    Retry only if the previous day's run is not completed.
+    """
+
     try:
         competition_date = yesterday_date()
 
-        if not is_completed(competition_date):
-            run_daily_competition()
+        run = get_run_row(competition_date)
+
+        if run and str(run.get("status", "")).upper() == "COMPLETED":
+            return
+
+        run_daily_competition()
 
     except Exception:
         logger.exception(
@@ -709,16 +627,14 @@ def start_scheduler():
     global _scheduler
 
     if _scheduler and _scheduler.running:
-        logger.info(
-            "Scheduler is already running."
-        )
+        logger.info("Scheduler is already running.")
         return _scheduler
 
     _scheduler = BackgroundScheduler(
         timezone=TZ,
     )
 
-    # One daily backup at midnight India time.
+    # Daily backup at 00:00 India time.
     _scheduler.add_job(
         midnight_backup,
         CronTrigger(
@@ -733,7 +649,7 @@ def start_scheduler():
         misfire_grace_time=3600,
     )
 
-    # Run competition once daily at 12:05 AM.
+    # Daily competition at 00:05 India time.
     _scheduler.add_job(
         run_daily_competition,
         CronTrigger(
@@ -748,8 +664,7 @@ def start_scheduler():
         misfire_grace_time=3600,
     )
 
-    # Recovery checks only the competition status.
-    # It does not directly create daily backups.
+    # Retry incomplete runs, but do not repeat completed ones.
     _scheduler.add_job(
         recover_pending_competition,
         "interval",
@@ -779,9 +694,6 @@ def stop_scheduler():
 
     if _scheduler and _scheduler.running:
         _scheduler.shutdown(wait=False)
-
-        logger.info(
-            "Scheduler stopped."
-        )
+        logger.info("Scheduler stopped.")
 
     _scheduler = None
