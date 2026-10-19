@@ -18,7 +18,7 @@ from config import (
 )
 
 from bot_instance import bot
-from backup import create_backup
+from backup import create_backup, validate_backup
 
 from database import get_connection
 
@@ -27,13 +27,8 @@ from daily_competition import (
     finalize_competition,
     get_winners,
     mark_winners_announced,
-    update_competition_status,
 )
 
-
-# =========================================================
-# CONFIGURATION
-# =========================================================
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +36,7 @@ TZ = ZoneInfo(TIMEZONE)
 
 _scheduler = None
 _run_lock = threading.Lock()
+_backup_lock = threading.Lock()
 
 
 # =========================================================
@@ -108,11 +104,6 @@ def get_run_row(competition_date):
 
 
 def ensure_run_exists(competition_date):
-    """
-    Create a competition record without replacing
-    any existing record or status.
-    """
-
     init_competition_tables()
 
     conn = get_connection()
@@ -130,11 +121,7 @@ def ensure_run_exists(competition_date):
             )
             VALUES (?, 'RUNNING', ?, ?)
             """,
-            (
-                competition_date,
-                now,
-                now,
-            ),
+            (competition_date, now, now),
         )
 
     finally:
@@ -148,10 +135,6 @@ def update_run_status(
     announcement_sent=None,
     completed=False,
 ):
-    """
-    Update only the requested fields.
-    """
-
     init_competition_tables()
 
     updates = ["updated_at = ?"]
@@ -194,60 +177,157 @@ def update_run_status(
 def is_completed(competition_date):
     row = get_run_row(competition_date)
 
-    if not row:
-        return False
-
-    return (
-        str(row.get("status", "")).upper()
+    return bool(
+        row
+        and str(row.get("status", "")).upper()
         == "COMPLETED"
     )
 
 
 # =========================================================
-# MIDNIGHT DATABASE BACKUP
+# DAILY MIDNIGHT BACKUP
 # =========================================================
 
 def midnight_backup():
     """
-    Create the midnight backup and notify admins.
-    Does not reset coins or referrals.
+    Create at most one successful daily backup per date.
+
+    The daily marker is stored in SQLite so a scheduler
+    retry does not create another backup after success.
     """
 
+    if not _backup_lock.acquire(blocking=False):
+        logger.warning(
+            "Daily backup is already running."
+        )
+        return
+
+    backup_date = today_date()
+
     try:
+        init_competition_tables()
+
+        conn = get_connection()
+
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS daily_backup_runs (
+                    backup_date TEXT PRIMARY KEY,
+                    backup_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+
+            existing = conn.execute(
+                """
+                SELECT backup_path
+                FROM daily_backup_runs
+                WHERE backup_date = ?
+                """,
+                (backup_date,),
+            ).fetchone()
+
+        finally:
+            conn.close()
+
+        if existing:
+            existing_path = existing["backup_path"]
+
+            if (
+                existing_path
+                and os.path.isfile(existing_path)
+                and validate_backup(existing_path)
+            ):
+                logger.info(
+                    "Daily backup already exists for %s: %s",
+                    backup_date,
+                    existing_path,
+                )
+                return
+
+            logger.warning(
+                "Daily backup marker exists but file is missing/invalid: %s",
+                backup_date,
+            )
+
+        # Create the real SQLite backup.
         backup_path = create_backup()
 
         if not backup_path:
             raise RuntimeError(
-                "Backup returned no file path."
+                "Backup function returned no path."
             )
 
+        if not os.path.isfile(backup_path):
+            raise FileNotFoundError(
+                "Backup file was not found after creation."
+            )
+
+        if not validate_backup(backup_path):
+            raise RuntimeError(
+                "Created backup failed validation."
+            )
+
+        # Record success only after the file is validated.
+        conn = get_connection()
+
+        try:
+            conn.execute(
+                """
+                INSERT INTO daily_backup_runs (
+                    backup_date,
+                    backup_path,
+                    created_at
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT(backup_date)
+                DO UPDATE SET
+                    backup_path = excluded.backup_path,
+                    created_at = excluded.created_at
+                """,
+                (
+                    backup_date,
+                    os.path.abspath(backup_path),
+                    now_string(),
+                ),
+            )
+
+        finally:
+            conn.close()
+
         filename = html.escape(
-            os.path.basename(str(backup_path))
+            os.path.basename(backup_path)
         )
 
         notify_admins(
             "💾 <b>DAILY DATABASE BACKUP</b>\n\n"
-            f"📅 Date: <code>{today_date()}</code>\n"
-            "✅ Backup created successfully.\n"
+            f"📅 Date: <code>{backup_date}</code>\n"
+            "✅ Database backup created successfully.\n"
             f"📁 File: <code>{filename}</code>"
         )
 
         logger.info(
-            "Midnight backup completed: %s",
+            "Daily backup completed: %s",
             backup_path,
         )
 
     except Exception as exc:
         logger.exception(
-            "Midnight backup failed."
+            "Daily backup failed for %s",
+            backup_date,
         )
 
         notify_admins(
-            "⚠️ <b>DATABASE BACKUP FAILED</b>\n\n"
-            f"📅 Date: <code>{today_date()}</code>\n"
+            "⚠️ <b>DAILY DATABASE BACKUP FAILED</b>\n\n"
+            f"📅 Date: <code>{backup_date}</code>\n"
             f"❌ Error: <code>"
-            f"{html.escape(str(exc)[:500])}</code>"
+            f"{html.escape(str(exc)[:400])}</code>"
         )
+
+    finally:
+        _backup_lock.release()
 
 
 # =========================================================
@@ -256,33 +336,77 @@ def midnight_backup():
 
 def ensure_competition_backup(competition_date):
     """
-    Create a backup for the competition if one has
-    not already been recorded for that date.
+    Reuse the daily backup when possible.
+    Otherwise create one competition backup and record it.
     """
 
     run = get_run_row(competition_date) or {}
 
-    if run.get("backup_path"):
-        return run["backup_path"]
+    recorded_path = run.get("backup_path")
 
+    if (
+        recorded_path
+        and os.path.isfile(recorded_path)
+        and validate_backup(recorded_path)
+    ):
+        return recorded_path
+
+    # Reuse today's successful midnight backup if available.
+    conn = get_connection()
+
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_backup_runs (
+                backup_date TEXT PRIMARY KEY,
+                backup_path TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        row = conn.execute(
+            """
+            SELECT backup_path
+            FROM daily_backup_runs
+            WHERE backup_date = ?
+            """,
+            (today_date(),),
+        ).fetchone()
+
+    finally:
+        conn.close()
+
+    if row:
+        path = row["backup_path"]
+
+        if (
+            path
+            and os.path.isfile(path)
+            and validate_backup(path)
+        ):
+            update_run_status(
+                competition_date,
+                backup_path=path,
+            )
+            return path
+
+    # Fallback: create a backup only when no usable backup exists.
     backup_path = create_backup()
 
-    if not backup_path:
+    if not backup_path or not validate_backup(backup_path):
         raise RuntimeError(
-            "Competition backup failed."
+            "Competition backup creation failed validation."
         )
 
     update_run_status(
-        competition_date=competition_date,
-        status="BACKED_UP",
+        competition_date,
         backup_path=backup_path,
     )
 
-    notify_admins(
-        "💾 <b>COMPETITION BACKUP COMPLETE</b>\n\n"
-        f"📅 Date: <code>{competition_date}</code>\n"
-        f"📁 File: <code>"
-        f"{html.escape(os.path.basename(str(backup_path)))}</code>"
+    logger.info(
+        "Competition backup created: %s",
+        backup_path,
     )
 
     return backup_path
@@ -292,10 +416,7 @@ def ensure_competition_backup(competition_date):
 # BUILD RESULTS MESSAGE
 # =========================================================
 
-def build_winner_message(
-    competition_date,
-    winners,
-):
+def build_winner_message(competition_date, winners):
     lines = [
         "🏆 <b>SF DAILY GIFTS — DAILY RESULTS</b>",
         "",
@@ -313,35 +434,17 @@ def build_winner_message(
 
     for winner in winners:
         rank = winner.get("rank", "-")
-        user_id = winner.get("user_id", "-")
-
-        first_name = (
-            winner.get("first_name") or "Unknown"
-        )
-
+        first_name = winner.get("first_name") or "Unknown"
         username = winner.get("username")
+        coins = winner.get("coins", 0)
+        referrals = winner.get("referrals", 0)
 
-        coins = winner.get(
-            "coins",
-            winner.get("daily_coins", 0),
-        )
-
-        referrals = winner.get(
-            "referrals",
-            winner.get("daily_referrals", 0),
-        )
-
-        safe_name = html.escape(
-            str(first_name)
-        )
+        safe_name = html.escape(str(first_name))
 
         if username:
-            safe_username = html.escape(
+            username_text = "@" + html.escape(
                 str(username).lstrip("@")
             )
-
-            username_text = f"@{safe_username}"
-
         else:
             username_text = "Not set"
 
@@ -370,10 +473,6 @@ def publish_winners(competition_date):
     run = get_run_row(competition_date) or {}
 
     if run.get("announcement_sent"):
-        logger.info(
-            "Results already published for %s",
-            competition_date,
-        )
         return True
 
     winners = get_winners(competition_date)
@@ -408,17 +507,6 @@ def publish_winners(competition_date):
 # =========================================================
 
 def reset_winners_daily_coins(competition_date):
-    """
-    Reset only the finalized winners' daily coins.
-
-    The reset and reset_at marker are committed together.
-    If recovery runs again, it will not reset those users
-    a second time.
-
-    Lifetime coins, referral history and referral counts
-    are not modified.
-    """
-
     init_competition_tables()
 
     winners = get_winners(competition_date)
@@ -436,7 +524,7 @@ def reset_winners_daily_coins(competition_date):
 
         run = conn.execute(
             """
-            SELECT status, announcement_sent, reset_at
+            SELECT announcement_sent, reset_at
             FROM competition_runs
             WHERE competition_date = ?
             """,
@@ -448,19 +536,13 @@ def reset_winners_daily_coins(competition_date):
                 "Competition record does not exist."
             )
 
-        # Never reset before results are published.
         if not run["announcement_sent"]:
             raise RuntimeError(
                 "Results are not confirmed as published."
             )
 
-        # Prevent a second reset after recovery.
         if run["reset_at"]:
             conn.commit()
-            logger.info(
-                "Winner reset already completed for %s",
-                competition_date,
-            )
             return 0
 
         reset_count = 0
@@ -483,7 +565,6 @@ def reset_winners_daily_coins(competition_date):
 
         now = now_string()
 
-        # Store the reset marker in the SAME transaction.
         conn.execute(
             """
             UPDATE competition_runs
@@ -491,17 +572,13 @@ def reset_winners_daily_coins(competition_date):
                 updated_at = ?
             WHERE competition_date = ?
             """,
-            (
-                now,
-                now,
-                competition_date,
-            ),
+            (now, now, competition_date),
         )
 
         conn.commit()
 
         logger.info(
-            "Winner reset completed for %s; rows=%s",
+            "Winner daily coins reset for %s; rows=%s",
             competition_date,
             reset_count,
         )
@@ -517,17 +594,13 @@ def reset_winners_daily_coins(competition_date):
 
 
 # =========================================================
-# RUN DAILY COMPETITION
+# DAILY COMPETITION
 # =========================================================
 
 def run_daily_competition():
     """
-    Previous-day sequence:
-    1. Ensure backup exists.
-    2. Finalize Top 10.
-    3. Publish results.
-    4. Reset only winners' daily coins.
-    5. Mark the run completed.
+    Finalize yesterday's competition, publish results,
+    reset winners' daily coins once, then mark completed.
     """
 
     if not _run_lock.acquire(blocking=False):
@@ -540,10 +613,7 @@ def run_daily_competition():
 
     try:
         init_competition_tables()
-
-        ensure_run_exists(
-            competition_date
-        )
+        ensure_run_exists(competition_date)
 
         if is_completed(competition_date):
             logger.info(
@@ -552,46 +622,30 @@ def run_daily_competition():
             )
             return
 
-        # STEP 1: BACKUP
-        ensure_competition_backup(
-            competition_date
-        )
+        ensure_competition_backup(competition_date)
 
-        # STEP 2: FINALIZE WINNERS
         run = get_run_row(competition_date) or {}
-
-        status = str(
-            run.get("status", "")
-        ).upper()
+        status = str(run.get("status", "")).upper()
 
         if status not in (
             "FINALIZED",
             "ANNOUNCED",
             "COMPLETED",
         ):
-            finalize_competition(
-                competition_date
-            )
+            finalize_competition(competition_date)
 
             update_run_status(
                 competition_date,
                 status="FINALIZED",
             )
 
-        # STEP 3: PUBLISH RESULTS
         run = get_run_row(competition_date) or {}
 
         if not run.get("announcement_sent"):
-            publish_winners(
-                competition_date
-            )
+            publish_winners(competition_date)
 
-        # STEP 4: RESET WINNERS ONCE
-        reset_winners_daily_coins(
-            competition_date
-        )
+        reset_winners_daily_coins(competition_date)
 
-        # STEP 5: MARK COMPLETED
         update_run_status(
             competition_date,
             status="COMPLETED",
@@ -622,7 +676,7 @@ def run_daily_competition():
             "⚠️ <b>DAILY COMPETITION ERROR</b>\n\n"
             f"📅 Date: <code>{competition_date}</code>\n"
             f"❌ Error: <code>"
-            f"{html.escape(str(exc)[:500])}</code>\n\n"
+            f"{html.escape(str(exc)[:400])}</code>\n\n"
             "The scheduler will retry automatically."
         )
 
@@ -664,7 +718,7 @@ def start_scheduler():
         timezone=TZ,
     )
 
-    # Midnight backup — India time.
+    # One daily backup at midnight India time.
     _scheduler.add_job(
         midnight_backup,
         CronTrigger(
@@ -679,7 +733,7 @@ def start_scheduler():
         misfire_grace_time=3600,
     )
 
-    # Previous day's competition.
+    # Run competition once daily at 12:05 AM.
     _scheduler.add_job(
         run_daily_competition,
         CronTrigger(
@@ -694,7 +748,8 @@ def start_scheduler():
         misfire_grace_time=3600,
     )
 
-    # Retry interrupted competition every five minutes.
+    # Recovery checks only the competition status.
+    # It does not directly create daily backups.
     _scheduler.add_job(
         recover_pending_competition,
         "interval",
