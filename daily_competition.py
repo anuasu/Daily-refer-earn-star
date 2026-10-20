@@ -192,6 +192,7 @@ def update_competition_status(
     backup_path=None,
     announcement_sent=None,
     completed=False,
+    finalized_at=None,
 ):
     init_competition_tables()
 
@@ -209,6 +210,10 @@ def update_competition_status(
     if announcement_sent is not None:
         updates.append("announcement_sent = ?")
         values.append(int(bool(announcement_sent)))
+
+    if finalized_at is not None:
+        updates.append("finalized_at = COALESCE(finalized_at, ?)")
+        values.append(str(finalized_at))
 
     if completed:
         updates.append("completed_at = ?")
