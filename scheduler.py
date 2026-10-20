@@ -190,7 +190,8 @@ def reset_winners_daily_coins(competition_date):
     # It does not reset referrals, referral history,
     # or lifetime_coins.
     reset_count = reset_daily_coins(
-        winner_ids=winner_ids
+        winner_ids=winner_ids,
+        competition_date=competition_date,
     )
 
     logger.info(
@@ -273,114 +274,91 @@ def send_database_backup():
 # DAILY COMPETITION: ONE SEQUENCE
 # ==========================================
 
-def run_daily_competition():
+def run_daily_competition(phase="announce"):
+    """Run one durable phase of the daily competition in Asia/Kolkata.
+
+    00:00: freeze and announce the previous day's Top 10.
+    00:01: reset only those winners' daily coins, then create and send
+    a validated database backup. Referral data is never reset here.
     """
-    Daily sequence at 12:00 AM India time:
-
-    1. Finalize Top 10.
-    2. Publish results in the main channel.
-    3. Reset only winners' daily coins.
-    4. Mark competition completed.
-    5. Create one backup and send the actual .db file.
-
-    No separate midnight backup job.
-    No five-minute recovery job.
-    """
-
     if not _run_lock.acquire(blocking=False):
-        logger.warning(
-            "Daily competition is already running."
-        )
+        logger.warning("Daily competition phase %s is already running.", phase)
         return
 
     competition_date = yesterday_date()
-
     try:
         init_competition_tables()
+        status = get_competition_status(competition_date) or {}
 
-        status = get_competition_status(
-            competition_date
-        ) or {}
+        if phase == "announce":
+            if status.get("announcement_sent"):
+                logger.info("Winners already announced for %s.", competition_date)
+                return
 
-        # Stop duplicate runs for a completed competition.
-        if str(status.get("status", "")).upper() == "COMPLETED":
-            logger.info(
-                "Competition already completed for %s.",
-                competition_date,
-            )
+            if not status.get("finalized_at"):
+                finalize_competition(competition_date)
+                update_competition_status(
+                    competition_date=competition_date,
+                    status="FINALIZED",
+                    finalized_at=datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
+                )
+
+            publish_winners(competition_date)
+            status = get_competition_status(competition_date) or {}
+            if not status.get("announcement_sent"):
+                raise RuntimeError("Results announcement is not confirmed.")
+            logger.info("Announcement phase completed for %s.", competition_date)
             return
 
-        # STEP 1: Save the day's Top 10.
-        if not status.get("finalized_at"):
-            finalize_competition(competition_date)
+        if phase != "reset_backup":
+            raise ValueError(f"Unknown competition phase: {phase}")
 
-            update_competition_status(
-                competition_date=competition_date,
-                status="FINALIZED",
-                finalized_at=datetime.now(TZ).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-            )
+        if str(status.get("status", "")).upper() == "COMPLETED":
+            logger.info("Competition and backup already completed for %s.", competition_date)
+            return
 
-        # STEP 2: Publish winners before resetting coins.
-        publish_winners(competition_date)
-
-        status = get_competition_status(
-            competition_date
-        ) or {}
-
+        # Never reset coins until the winner announcement is confirmed.
         if not status.get("announcement_sent"):
             raise RuntimeError(
-                "Results announcement is not confirmed. "
-                "Daily coins will not be reset."
+                "Winners have not been announced; refusing to reset coins."
             )
 
-        # STEP 3: Reset winners' daily coins only.
         if not status.get("reset_at"):
-            reset_winners_daily_coins(
-                competition_date
-            )
+            reset_winners_daily_coins(competition_date)
+            # reset_daily_coins records reset_at in the same transaction.
 
-            mark_competition_reset(
-                competition_date
-            )
-
-        # STEP 4: Mark competition completed.
-        # This prevents duplicate completion messages.
+        # Create and send a valid .db backup to admins before marking complete.
+        backup_path = send_database_backup()
         update_competition_status(
             competition_date=competition_date,
             status="COMPLETED",
+            backup_path=backup_path,
+            completed=True,
         )
-
         logger.info(
-            "Competition completed for %s.",
-            competition_date,
-        )
-
-        # STEP 5: Make the backup AFTER the reset
-        # and send the actual database file to admins.
-        backup_path = send_database_backup()
-
-        logger.info(
-            "Daily sequence completed. Backup: %s",
-            backup_path,
+            "Reset/backup phase completed for %s. Backup: %s",
+            competition_date, backup_path,
         )
 
     except Exception as exc:
-        logger.exception(
-            "Daily competition processing failed for %s.",
-            competition_date,
-        )
-
+        logger.exception("Daily competition phase %s failed for %s.", phase, competition_date)
         notify_admins(
             "⚠️ <b>DAILY SCHEDULE ERROR</b>\n\n"
             f"📅 Date: <code>{competition_date}</code>\n"
+            f"🔧 Phase: <code>{html.escape(phase)}</code>\n"
             f"❌ Error: <code>{html.escape(str(exc)[:600])}</code>\n\n"
             "Please check the hosting logs."
         )
-
     finally:
         _run_lock.release()
+
+
+def announce_daily_winners():
+    run_daily_competition("announce")
+
+
+def reset_and_backup_daily_winners():
+    run_daily_competition("reset_backup")
 
 
 # ==========================================
@@ -405,16 +383,22 @@ def start_scheduler():
         },
     )
 
-    # Only ONE scheduled job.
-    # Competition + reset + backup run in sequence.
+    # Two jobs preserve the requested order: announce at 00:00,
+    # reset winners and deliver backup at 00:01 India time.
     _scheduler.add_job(
-        run_daily_competition,
-        CronTrigger(
-            hour=0,
-            minute=0,
-            timezone=TZ,
-        ),
-        id="daily_competition_and_backup",
+        announce_daily_winners,
+        CronTrigger(hour=0, minute=0, timezone=TZ),
+        id="daily_winner_announcement",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+
+    _scheduler.add_job(
+        reset_and_backup_daily_winners,
+        CronTrigger(hour=0, minute=1, timezone=TZ),
+        id="daily_winner_reset_and_backup",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
@@ -425,7 +409,7 @@ def start_scheduler():
 
     logger.info(
         "Daily scheduler started. Timezone: %s. "
-        "Sequence: winners -> reset -> backup.",
+        "Schedule: announce 00:00; reset + backup 00:01.",
         TIMEZONE,
     )
 
